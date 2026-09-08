@@ -1,0 +1,51 @@
+# Dependencies and generated frontend files
+/node_modules/
+/dist/
+*.tsbuildinfo
+/vite.config.js
+/vite.config.d.ts
+
+# Rust/Tauri build output and generated capability schemas
+/src-tauri/target/
+/src-tauri/gen/
+
+# Built executables, packages, and atomic build staging files
+/inpaint-desktop
+/.inpaint-desktop.*
+/*.AppImage
+/*.deb
+/*.rpm
+
+# Local Python runtime and caches
+/.venv/
+/venv/
+/runtime-tools/
+/python/
+/.runtime-managed
+/.runtime-ready
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Downloaded weights, generated worker scripts, and Hugging Face credentials
+/models/**
+!/models/README.md
+
+# Local credentials/configuration; example environment files may be committed
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+/.agents/
+/.codex/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
+
+# resources/uv.gz and resources/*.whl are required embedded build inputs.
+# Keep them, their licenses, source assets, and both dependency lockfiles tracked.

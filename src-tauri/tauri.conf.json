@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Inpaint",
+  "version": "0.1.0",
+  "identifier": "local.inpaint.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Inpaint",
+        "width": 1380,
+        "height": 860,
+        "minWidth": 820,
+        "minHeight": 600,
+        "decorations": true,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": ["icons/256x256.png"],
+    "targets": ["rpm", "deb", "appimage"],
+    "category": "GraphicsAndDesign",
+    "shortDescription": "Remove unwanted objects from images locally",
+    "longDescription": "A private, GPU-powered image browser and object removal editor using LaMa inpainting."
+  }
+}
