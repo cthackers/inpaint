@@ -22,21 +22,16 @@ model weights.
 - Face replacement using a selected source photo, with a persistent InsightFace/INSwapper model.
 - Smart selection, clone/healing brushes, live color adjustments, crop/straighten, and canvas outpainting.
 - Background replacement with a color, another image, or a blurred background, plus cutout edge refinement.
-- Automatic removal after a Shift+paint stroke, or manual removal with Space.
-- Image and mask undo/redo.
 - Horizontal/vertical image flips and 90° left/right rotations from the top toolbar, with undo/redo.
-- Keyboard navigation between images.
-- Current output resolution and actual display zoom beside the filename.
 - Model weights stored together in the app's data directory.
 - A persistent worker that keeps all used models loaded between edits and tool switches.
 - Reusable workflows, batch queues, export copies, and a visual edit history.
-- Collapsible tool sections, remembered settings, and an in-app keyboard shortcut guide.
 
 ## Screenshots
 
-Real captures from the desktop application. Click an image to view it at full
-size; expand the sections below to explore the tools. Demo photo credits and
-capture notes are in [docs/screenshots](docs/screenshots/README.md).
+Screenshots of the desktop application. Click any image to view it at full
+size. Demo photo credits and capture notes are in
+[docs/screenshots](docs/screenshots/README.md).
 
 ### Object removal
 
@@ -57,8 +52,7 @@ NASA portraits of Neil Armstrong and Eileen Collins.
 
 [![Face replacement completed, with the source-photo picker and color-matching controls](docs/screenshots/face-result.webp)](docs/screenshots/face-result.webp)
 
-<details>
-<summary><strong>Upscaling and before/after comparison</strong></summary>
+### Upscaling and before/after comparison
 
 Real-HAT enlarges this image from 451 × 300 to 902 × 600 pixels. The comparison
 slider shows the previous image on the left and the edited image on the right,
@@ -68,10 +62,7 @@ aligned to the same frame.
 | --- | --- |
 | [![Real-HAT 2× upscale with updated output resolution](docs/screenshots/upscale.webp)](docs/screenshots/upscale.webp) | [![Original and upscaled cat image compared with a draggable divider](docs/screenshots/comparison.webp)](docs/screenshots/comparison.webp) |
 
-</details>
-
-<details>
-<summary><strong>Face restoration and Restormer detail restoration</strong></summary>
+### Face restoration and Restormer detail restoration
 
 GFPGAN restores faces; Restormer offers separate models for defocus blur, motion
 blur, and noise. These captures show GFPGAN followed by Restormer's defocus
@@ -81,10 +72,7 @@ model, with the portrait remaining 512 × 512 pixels.
 | --- | --- |
 | [![GFPGAN face restoration completed](docs/screenshots/gfpgan.webp)](docs/screenshots/gfpgan.webp) | [![Restormer defocus restoration completed at the original resolution](docs/screenshots/restormer.webp)](docs/screenshots/restormer.webp) |
 
-</details>
-
-<details>
-<summary><strong>Background removal, edge refinement, and replacement</strong></summary>
+### Background removal, edge refinement, and replacement
 
 Remove the background to transparency, refine the cutout edges, and choose a
 replacement. Shown here: a BRIA RMBG 1.4 cutout with its edge controls, followed
@@ -94,10 +82,7 @@ by a solid white background.
 | --- | --- |
 | [![Transparent portrait with background-removal and edge-refinement controls](docs/screenshots/background-result.webp)](docs/screenshots/background-result.webp) | [![Portrait placed on a solid white background](docs/screenshots/background-replace.webp)](docs/screenshots/background-replace.webp) |
 
-</details>
-
-<details>
-<summary><strong>Color, crop, and canvas extension</strong></summary>
+### Color, crop, and canvas extension
 
 Preview exposure, contrast, temperature, saturation, shadows, and highlights.
 Choose a crop ratio and straighten the image, or configure extra canvas space
@@ -109,10 +94,7 @@ for outpainting. Flip and rotation controls sit in the top toolbar.
 
 [![Canvas-extension settings with separate margins for each side](docs/screenshots/outpaint.webp)](docs/screenshots/outpaint.webp)
 
-</details>
-
-<details>
-<summary><strong>Workflows, batch processing, and export</strong></summary>
+### Workflows, batch processing, and export
 
 Build a sequence from the current tool settings, save it as a workflow, and
 queue multiple pictures. Export settings control format, quality, filename
@@ -124,10 +106,7 @@ suffix, and output dimensions. The batch capture shows two queued demo images.
 
 [![Export settings for format, quality, filename suffix, and output dimensions](docs/screenshots/export.webp)](docs/screenshots/export.webp)
 
-</details>
-
-<details>
-<summary><strong>Edit history and models in memory</strong></summary>
+### Edit history and models in memory
 
 Return to a previous edit using its thumbnail. Used models stay loaded across
 operations; the memory panel lists them and offers manual unloading.
@@ -136,10 +115,7 @@ operations; the memory panel lists them and offers manual unloading.
 | --- | --- |
 | [![History showing restoration, background removal, and background replacement](docs/screenshots/history.webp)](docs/screenshots/history.webp) | [![Memory panel showing LaMa, face swap, GFPGAN, Restormer, and background removal loaded together](docs/screenshots/memory.webp)](docs/screenshots/memory.webp) |
 
-</details>
-
-<details>
-<summary><strong>Folder browsing and keyboard shortcuts</strong></summary>
+### Folder browsing and keyboard shortcuts
 
 Browse a folder's thumbnails and double-click to edit. The **?** overlay lists
 navigation, painting, and action shortcuts; tool buttons also show their keys.
@@ -147,8 +123,6 @@ navigation, painting, and action shortcuts; tool buttons also show their keys.
 | Image gallery | Shortcut overlay |
 | --- | --- |
 | [![Folder tree and image thumbnail gallery](docs/screenshots/gallery.webp)](docs/screenshots/gallery.webp) | [![In-app keyboard shortcut overlay](docs/screenshots/shortcuts.webp)](docs/screenshots/shortcuts.webp) |
-
-</details>
 
 ## Platform and hardware
 

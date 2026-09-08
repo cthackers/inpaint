@@ -1,6 +1,10 @@
 # Dependencies and generated frontend files
 /node_modules/
 /dist/
+/.flatpak-builder/
+/build-flatpak/
+/flatpak-repo/
+/*.flatpak
 *.tsbuildinfo
 /vite.config.js
 /vite.config.d.ts
