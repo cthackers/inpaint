@@ -68,7 +68,9 @@ access token does not grant commercial permission.
 | GFPGAN | [Upstream project](https://github.com/TencentARC/GFPGAN#scroll-license-and-acknowledgement) under Apache-2.0, with its supporting face-detection and parsing components. |
 | Real-ESRGAN | [Upstream project license](https://github.com/xinntao/Real-ESRGAN/blob/master/LICENSE) is BSD-3-Clause. |
 | HAT | [Upstream project license](https://github.com/XPixelGroup/HAT/blob/main/LICENSE) is Apache-2.0. |
-| Restormer | [Upstream project license](https://github.com/swz30/Restormer/blob/main/LICENSE.md) is MIT; checkpoints come from its v1.0 release. |
+| Restormer | [Upstream project license](https://github.com/swz30/Restormer/blob/main/LICENSE.md) is MIT; the motion deblurring checkpoint comes from its v1.0 release. |
+| FBCNN | [Upstream project license](https://github.com/jiaxi-jiang/FBCNN/blob/main/LICENSE) is Apache-2.0; the color checkpoint comes from its v1.0 release. |
+| SCUNet | [Upstream project license](https://github.com/cszn/SCUNet/blob/main/LICENSE) is Apache-2.0; the real-noise checkpoint comes from the [KAIR](https://github.com/cszn/KAIR) v1.0 release (MIT). |
 | MobileSAM | [Upstream project license](https://github.com/ChaoningZhang/MobileSAM/blob/master/LICENSE) is Apache-2.0. |
 | U²-Net | [Upstream project license](https://github.com/xuebinqin/U-2-Net/blob/master/LICENSE) is Apache-2.0; models are downloaded through rembg. |
 

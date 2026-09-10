@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type Plugin = "restormer" | "gfpgan" | "realesrgan" | "remove_bg" | "hat" | "lanczos";
+export type Plugin = "restore" | "gfpgan" | "realesrgan" | "remove_bg" | "hat" | "lanczos";
+export const RESTORE_MODES = ["compressed", "natural", "jpeg", "noise", "motion"] as const;
+// Restore detail replaced Restormer's blur and noise models; history and saved workflows may still name them.
+export const RESTORMER_MODES: Record<string, string> = { defocus: "compressed", denoise: "noise", motion: "motion" };
 export type Rect = [number, number, number, number];
 export type Adjustments = { exposure: number; contrast: number; temperature: number; saturation: number; shadows: number; highlights: number };
 export const neutralAdjustments: Adjustments = { exposure: 0, contrast: 0, temperature: 0, saturation: 0, shadows: 0, highlights: 0 };
@@ -61,7 +64,8 @@ export async function executeOperation(data: string, operation: Operation, refer
     return (await imageAction("face_preview", data, operation)).imageData;
   }
   if (operation.kind === "plugin") {
-    if (operation.plugin === "restormer" && operation.strength === 0) return data;
+    if ((operation.plugin as string) === "restormer") operation = { ...operation, plugin: "restore", option: RESTORMER_MODES[operation.option] ?? "compressed" };
+    if (operation.plugin === "restore" && operation.strength === 0) return data;
     const result = await invoke<string>("run_plugin", { imageData: data, ...operation, sourceImageData: null });
     return operation.plugin === "gfpgan" ? blendImages(data, result, operation.strength ?? 1) : result;
   }

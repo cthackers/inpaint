@@ -13,7 +13,7 @@ import traceback
 SDXL_MODEL = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
 LAMA_MODEL_URL = "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"
 ERASE_MODELS = {"mat", "zits", "migan"}
-PLUGIN_NAMES = {"restormer", "gfpgan", "realesrgan", "remove_bg", "face_swap", "hat", "lanczos"}
+PLUGIN_NAMES = {"restore", "gfpgan", "realesrgan", "remove_bg", "face_swap", "hat", "lanczos"}
 
 
 def configure_cache(models_dir: Path) -> None:
@@ -138,9 +138,10 @@ def process_image(model_name, loaded_model, input_path, mask_path, output_path, 
 def load_plugin(plugin_name: str, option: str):
     from downloads import progress
     progress(f"Preparing {plugin_name}", None, "Loading cached weights or downloading on first use")
-    if plugin_name == "restormer":
-        from restormer import RestormerRestorer
-        return RestormerRestorer(Path(os.environ["XDG_CACHE_HOME"]) / "restormer", option), f"restormer:{option}"
+    if plugin_name == "restore":
+        from restore import DetailRestorer
+        cache = Path(os.environ["XDG_CACHE_HOME"])
+        return DetailRestorer(cache / "restore", Path(os.environ["TORCH_HOME"]) / "hub/checkpoints", cache / "restormer"), "restore"
     if plugin_name in {"hat", "lanczos"}:
         from upscale import HatUpscaler, LanczosUpscaler
         if plugin_name == "lanczos":
@@ -199,9 +200,9 @@ def load_plugin(plugin_name: str, option: str):
     raise ValueError(f"unsupported plugin: {plugin_name}")
 
 
-def process_plugin(plugin_name, plugin, input_path, output_path, scale, donor_path=None, denoise=0.25, face_restorer=None, strength=1.0):
-    if plugin_name == "restormer":
-        plugin.restore(input_path, output_path, strength)
+def process_plugin(plugin_name, plugin, input_path, output_path, scale, donor_path=None, denoise=0.25, face_restorer=None, strength=1.0, option=""):
+    if plugin_name == "restore":
+        plugin.restore(input_path, output_path, option, strength)
         return
     if plugin_name in {"hat", "lanczos"}:
         plugin.upscale(input_path, output_path, scale)
@@ -366,7 +367,7 @@ def worker_main(models_dir: Path) -> None:
                         raise ValueError("Select a source photo before replacing a face.")
                     donor_path = Path(request["donor"])
                 requested_plugin_name = (
-                    plugin_name if plugin_name in {"gfpgan", "face_swap", "hat", "lanczos"} else f"{plugin_name}:{option}"
+                    plugin_name if plugin_name in {"gfpgan", "face_swap", "hat", "lanczos", "restore"} else f"{plugin_name}:{option}"
                 )
                 if requested_plugin_name not in plugins:
                     plugins[requested_plugin_name] = load_plugin(plugin_name, option)[0]
@@ -381,6 +382,7 @@ def worker_main(models_dir: Path) -> None:
                     donor_path,
                     denoise=denoise,
                     strength=float(request.get("strength", 1.0)),
+                    option=option,
                     face_restorer=plugins.get("gfpgan") if plugin_name == "face_swap" else None,
                 )
                 respond({"ok": True, "plugin": requested_plugin_name})
