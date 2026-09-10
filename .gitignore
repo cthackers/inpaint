@@ -19,6 +19,8 @@
 /*.AppImage
 /*.deb
 /*.rpm
+/inpaint-extension.crx
+/inpaint-extension.zip
 
 # Local Python runtime and caches
 /.venv/
@@ -33,23 +35,32 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .cache/
-
+packaging/
 # Downloaded weights, generated worker scripts, and Hugging Face credentials
 /models/**
 !/models/README.md
 
 # Local credentials/configuration; example environment files may be committed
+# App data written to the data directory, which is the checkout when it has .venv/.
+# inpaint.db holds credentials; the JSON files are from before it and are imported on start.
+/inpaint.db
+/inpaint.db-wal
+/inpaint.db-shm
+/server.json
+/immich.json
+/stores.json
+/dropbox.json
+/tray.json
 .env
 .env.*
 !.env.example
 !.env.sample
 !.env.template
-/.agents/
-/.codex/
 .idea/
 *.log
 .DS_Store
 Thumbs.db
+*.crx
 
 # resources/uv.gz and resources/*.whl are required embedded build inputs.
-# Keep them, their licenses, source assets, and both dependency lockfiles tracked.
+

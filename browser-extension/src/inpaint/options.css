@@ -1,0 +1,17 @@
+body { margin: 0; color: #e9e8e3; background: #151513; font: 14px/1.5 system-ui, sans-serif; }
+main { display: grid; gap: 16px; max-width: 720px; margin: 0 auto; padding: 32px 20px; }
+h1 { margin: 0; font-size: 22px; }
+h2 { margin: 0 0 4px; font-size: 16px; }
+h3 { margin: 8px 0 0; font-size: 14px; }
+p { margin: 0; color: #c7c4b8; }
+.hint { color: #a3a197; font-size: 13px; }
+section { display: grid; gap: 10px; padding: 16px; border: 1px solid #3a3a33; border-radius: 10px; background: #1f1f1b; }
+label { display: grid; gap: 4px; }
+input { padding: 7px 9px; color: #eee; border: 1px solid #55554c; border-radius: 6px; background: #292923; font: inherit; }
+button { justify-self: start; padding: 6px 12px; color: #eee; border: 1px solid #55554c; border-radius: 6px; background: #2f2f29; font: inherit; cursor: pointer; }
+button:hover { background: #3a3a33; }
+button.primary { color: #fff; border-color: #c15a3a; background: #a8482b; }
+.row { display: flex; align-items: center; gap: 10px; }
+.result { color: #b1afa5; overflow-wrap: anywhere; }
+.mapping { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; }
+kbd { padding: 1px 5px; border: 1px solid #55554c; border-radius: 4px; font: 12px ui-monospace, monospace; }

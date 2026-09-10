@@ -1,21 +1,24 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm, open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft, ArrowRight, Brush, Check, Eraser, LoaderCircle,
   ChevronDown, Eye, EyeOff, FlipHorizontal, FlipVertical, ImageOff, Maximize2, Play, Redo2, RotateCcw, RotateCw,
-  Save, Scan, ScanFace, Sparkles, Undo2, UserRound, X, ZoomIn, ZoomOut, Crop, History, Layers, Download, SlidersHorizontal,
+  Save, Scan, ScanFace, Sparkles, Tags, Trash2, Undo2, UserRound, X, ZoomIn, ZoomOut, Crop, History, Layers, Download, SlidersHorizontal,
 } from "lucide-react";
-import type { ImageEntry } from "./types";
+import type { ImageEntry, Store } from "./types";
+import ImmichPanel from "./ImmichPanel";
 import Workspace, { type WorkspaceTab } from "./Workspace";
 import { useEditHistory, type HistoryEntry } from "./useEditHistory";
 import { adjustImage, neutralAdjustments, loadImage, blendImages, executeOperation, imageAction, type FaceBox, type Operation, type Rect } from "./editorOperations";
 import AdvancedTools, { BackgroundEdgeTools, type BrushTool, type BrushSettings, type Edges, type Extension } from "./AdvancedTools";
 import { INPAINT_MODELS, type InpaintModel } from "./models";
-import { usePreference, useSavedChoice } from "./preferences";
+import FaceLibrary from "./FaceLibrary";
+import { FACE_LIBRARY_PREFERENCE, usePreference, useSavedChoice } from "./preferences";
 import ToolSection from "./ToolSection";
 import { useCanvasView } from "./useCanvasView";
 import { appendMaskHistory, applyMaskSnapshot, captureMaskRegion, emptySnapshot, snapshotMask, type MaskSnapshot } from "./maskHistory";
+import { storage } from "./storage";
 
 type EditorProps = {
   image: ImageEntry;
@@ -25,14 +28,27 @@ type EditorProps = {
   onBrushSizeChange: Dispatch<SetStateAction<number>>;
   faceSwapSource: FaceSwapSource | null;
   onFaceSwapSourceChange: (source: FaceSwapSource) => void;
+  onFaceSwapSourceClear: () => void;
   onExit: () => void;
   onNavigate: (offset: number) => void;
+  /** Image data to edit instead of reading image.path; an empty path makes Save ask where to save. */
+  initialData?: string;
+  /** Another picture is waiting to open; the editor settles unsaved changes, then calls onReplace. */
+  replaceRequested?: boolean;
+  onReplace?: () => void;
+  onReplaceCancel?: () => void;
+  /** Called with the path of every successful save. */
+  onSaved?: (path: string) => void;
+  /** Called after the picture was deleted. */
+  onDeleted?: (path: string) => void;
+  /** Image stores marked Immich compatible; their pictures get the Immich panel. */
+  immichStores?: Store[];
 };
 
 export type FaceSwapSource = { path: string; data: string };
 
 type Point = { x: number; y: number };
-type PendingLeave = { kind: "exit" } | { kind: "navigate"; offset: number };
+type PendingLeave = { kind: "exit" } | { kind: "navigate"; offset: number } | { kind: "replace" };
 
 const IMAGE_TRANSFORMS = [
   { id: "flip-horizontal", label: "Flip horizontally", icon: FlipHorizontal },
@@ -48,13 +64,16 @@ const UPSCALE_OPTIONS = [
   { id: "lanczos", plugin: "lanczos", name: "Lanczos · No AI", description: "Standard resizing without AI reconstruction. No model needed." },
 ] as const;
 
-const RESTORMER_OPTIONS = [
-  { id: "defocus", name: "Out-of-focus blur", description: "Restore detail softened by missed focus or lens blur." },
-  { id: "motion", name: "Motion blur", description: "Reduce blur from camera shake or movement." },
-  { id: "denoise", name: "Photo noise", description: "Reduce sensor noise. Use a blur model when you want to sharpen soft detail." },
+// download: the weights a mode fetches on first use.
+const RESTORE_OPTIONS = [
+  { id: "compressed", name: "Compressed or soft photo", description: "Removes JPEG blocks, then adds detail with Real-ESRGAN. Best for pictures saved from the web.", download: "about 355 MB" },
+  { id: "natural", name: "Natural detail", description: "Removes JPEG blocks, then adds finer, more natural detail with Real-HAT. Slower.", download: "about 290 MB, plus 170 MB for Real-HAT unless the upscaler already has it," },
+  { id: "jpeg", name: "JPEG artifacts only", description: "Removes compression blocks and ringing without sharpening.", download: "about 290 MB" },
+  { id: "noise", name: "Photo noise", description: "Removes grain and color noise from camera photos with SCUNet.", download: "about 70 MB" },
+  { id: "motion", name: "Motion blur", description: "Reduces blur from camera shake or movement with Restormer.", download: "about 100 MB" },
 ] as const;
 
-export default function Editor({ image, index, total, brushSize, onBrushSizeChange, faceSwapSource, onFaceSwapSourceChange, onExit, onNavigate }: EditorProps) {
+export default function Editor({ image, index, total, brushSize, onBrushSizeChange, faceSwapSource, onFaceSwapSourceChange, onFaceSwapSourceClear, onExit, onNavigate, initialData, replaceRequested, onReplace, onReplaceCancel, onSaved, onDeleted, immichStores }: EditorProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const maskRef = useRef<HTMLCanvasElement>(null);
   const drawing = useRef(false);
@@ -89,16 +108,16 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   const [message, setMessage] = useState("");
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [model, setModel] = useState<InpaintModel>(() => {
-    const saved = localStorage.getItem("inpaint.model");
+    const saved = storage.getItem("inpaint.model");
     return INPAINT_MODELS.find((option) => option.id === saved) ?? INPAINT_MODELS[0];
   });
   const [prompt, setPrompt] = usePreference("inpaint.prompt", "");
   const [stageReady, setStageReady] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
   const [pendingLeave, setPendingLeave] = useState<PendingLeave | null>(null);
-  const [restormerModel, setRestormerModel] = useSavedChoice<string>("inpaint.restormerModel", RESTORMER_OPTIONS.map((option) => option.id));
-  const [restormerStrength, setRestormerStrength] = useSavedChoice<number>("inpaint.restormerStrength", [100, ...Array.from({ length: 21 }, (_, i) => i * 5)]);
-  const selectedRestormer = RESTORMER_OPTIONS.find((option) => option.id === restormerModel)!;
+  const [restoreMode, setRestoreMode] = useSavedChoice<string>("inpaint.restoreMode", RESTORE_OPTIONS.map((option) => option.id));
+  const [restoreStrength, setRestoreStrength] = useSavedChoice<number>("inpaint.restoreStrength", [100, ...Array.from({ length: 21 }, (_, i) => i * 5)]);
+  const selectedRestore = RESTORE_OPTIONS.find((option) => option.id === restoreMode)!;
   const [upscaleModel, setUpscaleModel] = useSavedChoice<string>("inpaint.upscaleModel", UPSCALE_OPTIONS.map((option) => option.id));
   const [upscaleScale, setUpscaleScale] = useSavedChoice<number>("inpaint.upscaleScale", [2, 3, 4]);
   const [upscaleDenoise, setUpscaleDenoise] = useSavedChoice<number>("inpaint.upscaleDenoise", [25, ...Array.from({ length: 21 }, (_, index) => index * 5)]);
@@ -158,6 +177,14 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   const [extension, setExtension] = usePreference<Extension>("inpaint.extension", { left: 128, right: 128, top: 0, bottom: 0, model: "sdxl", prompt: "" });
   const [faceColorMatch, setFaceColorMatch] = useSavedChoice<number>("inpaint.faceColorMatch", [0, ...Array.from({ length: 20 }, (_, i) => (i + 1) * 5)]);
   const activeFaceSource = selectedFace ? assignments[selectedFace.id] ?? faceSwapSource : faceSwapSource;
+  const [faceLibrary, setFaceLibrary] = usePreference<string[]>(FACE_LIBRARY_PREFERENCE, [], (paths) => paths.every((path) => typeof path === "string"));
+  // Every face photo chosen joins the saved faces, newest first.
+  useEffect(() => {
+    const path = faceSwapSource?.path;
+    if (path) setFaceLibrary((saved) => (saved.includes(path) ? saved : [path, ...saved]));
+  }, [faceSwapSource?.path]);
+  const [deleting, setDeleting] = useState(false);
+  const [immichOpen, setImmichOpen] = usePreference("inpaint.immichPanel", true);
   const { stageRef, cursorRef, zoomLabelRef, zoomValueRef, panRef, zoomRef, zoom, setPan, setZoom, getViewportBounds, moveCursor, hideCursor } = useCanvasView(
     viewportRef, fitScale, brushSize, !!imageData && !working && !showOriginal && !compare && !cropMode && !selectingFace,
   );
@@ -183,7 +210,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     setStageReady(false);
     setShowOriginal(false);
     setPendingLeave(null);
-    invoke<string>("read_image_data", { path: image.path })
+    (initialData ? Promise.resolve(initialData) : invoke<string>("read_image_data", { path: image.path }))
       .then((data) => {
         if (!active) return;
         history.reset(data);
@@ -191,7 +218,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       })
       .catch((error) => active && setMessage(String(error)));
     return () => { active = false; };
-  }, [image.path]);
+  }, [image.path, initialData]);
 
   useEffect(() => () => {
     if (stageReadyFrame.current !== null) cancelAnimationFrame(stageReadyFrame.current);
@@ -303,15 +330,36 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     return () => { active = false; clearTimeout(timer); };
   }, [adjustmentActive, adjustments, imageData]);
 
+  // Pictures that did not come from disk, and GIF, BMP or TIFF pictures that Save cannot write,
+  // have no path until the first Save chooses one.
+  const writable = /^(png|jpe?g|webp)$/.test(image.extension);
+  const [savePath, setSavePath] = useState(writable ? image.path : "");
+  const displayName = savePath ? savePath.split("/").at(-1) ?? image.name : image.name;
   const save = useCallback(async (): Promise<boolean> => {
     if (!imageData || saving || working) return false;
+    let path = savePath;
+    if (!path) {
+      try {
+        const suggested = (image.path || image.name).replace(/\.(gif|bmp|tiff?)$/i, ".png");
+        const chosen = await saveDialog({ title: "Save image", defaultPath: suggested, filters: [{ name: "Pictures", extensions: ["png", "jpg", "jpeg", "webp"] }] });
+        if (!chosen) return false;
+        const extension = /^(png|jpe?g|webp)$/.test(image.extension) ? image.extension : "png";
+        path = /\.(png|jpe?g|webp)$/i.test(chosen) ? chosen : `${chosen}.${extension}`;
+      } catch (error) {
+        setMessage(`Save failed: ${String(error)}`);
+        return false;
+      }
+    }
     setSaving(true);
     setMessage("Saving…");
     try {
-      await invoke("save_image", { path: image.path, imageData });
+      // Pictures of Immich-compatible image stores come back with a note about Immich.
+      const note = await invoke<string | null>("save_image", { path, imageData });
+      setSavePath(path);
       history.markSaved();
-      setMessage("Saved");
-      window.setTimeout(() => setMessage(""), 1600);
+      onSaved?.(path);
+      setMessage(note ? `Saved. ${note}` : "Saved");
+      window.setTimeout(() => setMessage(""), note ? 6000 : 1600);
       return true;
     } catch (error) {
       setMessage(`Save failed: ${String(error)}`);
@@ -319,7 +367,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     } finally {
       setSaving(false);
     }
-  }, [image.path, imageData, saving, working]);
+  }, [image.name, image.path, image.extension, savePath, imageData, saving, working, onSaved]);
 
   const getBinaryMask = () => {
     const source = maskRef.current!;
@@ -376,9 +424,20 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     else onNavigate(offset);
   }, [dirty, onNavigate, saving, working]);
 
+  const replaceHandled = useRef(false);
+  useEffect(() => {
+    if (!replaceRequested) { replaceHandled.current = false; return; }
+    if (replaceHandled.current || working || saving || pendingLeave) return;
+    replaceHandled.current = true;
+    if (dirty) setPendingLeave({ kind: "replace" });
+    else onReplace?.();
+  }, [replaceRequested, working, saving, pendingLeave, dirty, onReplace]);
+
   const finishPendingLeave = useCallback((pending: PendingLeave) => {
-    pending.kind === "exit" ? onExit() : onNavigate(pending.offset);
-  }, [onExit, onNavigate]);
+    if (pending.kind === "exit") onExit();
+    else if (pending.kind === "replace") onReplace?.();
+    else onNavigate(pending.offset);
+  }, [onExit, onNavigate, onReplace]);
 
   const resolvePendingLeave = useCallback(async (saveChanges: boolean) => {
     if (!pendingLeave || leaveResolving.current) return;
@@ -416,6 +475,60 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     }
   };
 
+  // Clears the photo shown in the picker: the selected face's own source, otherwise the shared one.
+  const clearFacePhoto = () => {
+    if (selectedFace && assignments[selectedFace.id]) {
+      setAssignments((old) => Object.fromEntries(Object.entries(old).filter(([id]) => Number(id) !== selectedFace.id)));
+    } else {
+      onFaceSwapSourceClear();
+    }
+  };
+
+  // A saved face becomes the face source, and the selected face's source when one is selected.
+  const chooseSavedFace = (path: string, preview: string) => {
+    const source = { path, data: preview };
+    onFaceSwapSourceChange(source);
+    if (selectedFace) setAssignments((old) => ({ ...old, [selectedFace.id]: source }));
+  };
+
+  const removeSavedFace = (path: string) => {
+    setFaceLibrary((saved) => saved.filter((item) => item !== path));
+    setAssignments((old) => Object.fromEntries(Object.entries(old).filter(([, source]) => source.path !== path)));
+    if (faceSwapSource?.path === path) onFaceSwapSourceClear();
+  };
+
+  const addFacePhotos = async () => {
+    try {
+      const selected = await open({ title: "Add face photos", multiple: true, directory: false, filters: [{ name: "Photos", extensions: ["png", "jpg", "jpeg", "webp"] }] });
+      const paths = Array.isArray(selected) ? selected : typeof selected === "string" ? [selected] : [];
+      if (paths.length) setFaceLibrary((saved) => [...paths.filter((path) => !saved.includes(path)), ...saved]);
+    } catch (error) {
+      setMessage(`Photo selection failed: ${String(error)}`);
+    }
+  };
+
+  const deletePicture = async () => {
+    if (!image.path || working || saving || deleting) return;
+    const name = image.path.split("/").at(-1) ?? image.path;
+    const unsaved = dirty ? " Your unsaved edits are lost too." : "";
+    if (!await confirm(`Delete ${name}? It goes to the trash, or to Immich's trash in an Immich-compatible store.${unsaved}`, { title: "Delete picture", kind: "warning", okLabel: "Delete", cancelLabel: "Cancel" })) return;
+    setDeleting(true);
+    setMessage("Deleting…");
+    try {
+      const result = await invoke<{ deleted: boolean; message: string }>("delete_image", { path: image.path, permanent: false });
+      if (!result.deleted) {
+        const permanently = await confirm(`${result.message} Delete ${name} permanently instead? This cannot be undone.`, { title: "Delete permanently", kind: "warning", okLabel: "Delete permanently", cancelLabel: "Keep it" });
+        if (!permanently) { setMessage(""); return; }
+        await invoke("delete_image", { path: image.path, permanent: true });
+      }
+      onDeleted?.(image.path);
+    } catch (error) {
+      setMessage(`Delete failed: ${String(error)}`);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const performOperation = async (operation: Operation) => {
     if (working || saving || !imageData) return;
     setWorking(true); setShowOriginal(false);
@@ -444,12 +557,17 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     finally { setWorking(false); }
   };
 
+  // Replaces the selected face, or the largest one, with the face in the photo at `donor`.
+  const replaceFace = async (donor: string) => {
+    const box = selectedFace?.box;
+    await performOperation({ kind: "face", label: "Face replacement", donor,
+      strength: restorationStrength / 100, colorMatch: faceColorMatch / 100, target: box ? [box[0] + box[2] / 2, box[1] + box[3] / 2] : undefined });
+  };
+
   const runImagePlugin = async (plugin: "gfpgan" | "realesrgan" | "remove_bg" | "face_swap" | "hat" | "lanczos", option: string, pluginScale: number, label: string) => {
     if (plugin === "face_swap") {
       if (!activeFaceSource || choosingFace) return;
-      const box = selectedFace?.box;
-      await performOperation({ kind: "face", label: "Face replacement", donor: activeFaceSource.path,
-        strength: restorationStrength / 100, colorMatch: faceColorMatch / 100, target: box ? [box[0] + box[2] / 2, box[1] + box[3] / 2] : undefined });
+      await replaceFace(activeFaceSource.path);
     } else {
       await performOperation({ kind: "plugin", plugin, option, scale: pluginScale, label, denoise: upscaleDenoise / 100, strength: restorationStrength / 100 });
     }
@@ -485,10 +603,10 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
 
   const backgroundOperation: Operation = { kind: "background", label: `Background · ${backgroundType}`, mode: backgroundType,
     color: backgroundColor, path: backgroundPath, blur: backgroundBlur, removeFirst, model: backgroundModel };
-  const restormerOperation: Operation = { kind: "plugin", plugin: "restormer", option: restormerModel,
-    scale: 1, denoise: 0, strength: restormerStrength / 100, label: `Restormer · ${selectedRestormer.name} · ${restormerStrength}%` };
+  const restoreOperation: Operation = { kind: "plugin", plugin: "restore", option: restoreMode,
+    scale: 1, denoise: 0, strength: restoreStrength / 100, label: `Restore detail · ${selectedRestore.name} · ${restoreStrength}%` };
   const suggestions: Operation[] = [
-    restormerOperation,
+    restoreOperation,
     { kind: "adjust", label: "Color and lighting", values: adjustments },
     { kind: "refine_edges", label: "Refine background edges", ...edges },
     { kind: "outpaint", label: "Extend canvas", ...extension },
@@ -604,7 +722,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     setCropMode(!cropMode); setSelectingFace(false); setCompare(false); setShowOriginal(false);
   };
   const actionShortcuts = [
-    { key: "t", label: "Restore detail · Restormer", run: () => { if (restormerStrength > 0) void performOperation(restormerOperation); } },
+    { key: "t", label: "Restore detail", run: () => { if (restoreStrength > 0) void performOperation(restoreOperation); } },
     { key: "u", label: "Upscale image", run: () => void runImagePlugin(selectedUpscaler.plugin, upscaleModel, upscaleScale, selectedUpscaler.name) },
     { key: "f", label: "Restore faces · GFPGAN", run: () => void runImagePlugin("gfpgan", "gfpgan", 1, "GFPGAN") },
     { key: "r", label: "Replace selected / largest face", run: () => {
@@ -636,6 +754,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
           void resolvePendingLeave(false);
         } else if (event.key === "Escape") {
           event.preventDefault();
+          if (pendingLeave.kind === "replace") onReplaceCancel?.();
           setPendingLeave(null);
         }
         return;
@@ -737,7 +856,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       window.removeEventListener("keyup", keyUp);
       window.removeEventListener("blur", blur);
     };
-  }, [actualSize, fitImage, imageData, index, maskDirty, model, pendingLeave, prompt, redo, resolvePendingLeave, safeExit, safeNavigate, save, total, undo, working, saving, cropMode, selectingFace, compare, showOriginal, zoomIn, zoomOut, actionShortcuts]);
+  }, [actualSize, fitImage, imageData, index, maskDirty, model, pendingLeave, prompt, redo, resolvePendingLeave, safeExit, safeNavigate, save, total, undo, working, saving, cropMode, selectingFace, compare, showOriginal, zoomIn, zoomOut, actionShortcuts, onReplaceCancel]);
 
   const canvasPoint = (event: { clientX: number; clientY: number }): Point | null => {
     const bounds = getViewportBounds();
@@ -910,15 +1029,20 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     }
   };
 
+  // Pictures of Immich-compatible stores get the Immich panel, which takes turns with the workspace drawer.
+  const immichStore = image.path ? immichStores?.find((store) => image.path.startsWith(`${store.path.replace(/\/+$/, "")}/`)) : undefined;
+  const immichVisible = !!immichStore && immichOpen && !workspaceOpen;
+
   return (
     <div className="editor-shell">
       <header className="editor-bar">
         <div className="editor-left">
           <button className="icon-button" onClick={safeExit} title="Back to browser (Esc)"><X size={19} /></button>
           <div className="file-heading">
-            <strong title={image.name}>{image.name}</strong>
+            <strong title={savePath || image.name}>{displayName}</strong>
             <span className="file-details">
               <span>{index + 1} of {total}</span>
+              {!savePath && <span title="Save asks where to store this picture">{image.path ? `${image.extension.toUpperCase()} · saved as a new file` : "Not on disk"}</span>}
               {stageReady && <>
                 <span title="Current output resolution">{dimensions.width} × {dimensions.height} px</span>
                 <span ref={zoomLabelRef} title="Actual display zoom">{Math.round(scale * 100)}% zoom</span>
@@ -950,7 +1074,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
                     className={`model-option ${option.id === model.id ? "selected" : ""}`}
                     onClick={() => {
                       setModel(option);
-                      localStorage.setItem("inpaint.model", option.id);
+                      storage.setItem("inpaint.model", option.id);
                       setModelMenuOpen(false);
                     }}
                   >
@@ -981,7 +1105,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
           <button className="icon-button" onClick={redo} disabled={working || saving || (!maskRedo.length && !history.canRedo)} title="Redo (Ctrl+Shift+Z)"><Redo2 size={18} /></button>
           <button className="icon-button" onClick={() => { pushMaskUndo(); clearMask(); }} disabled={!maskDirty || working || saving} title="Clear mask"><Eraser size={18} /></button>
           <span className="bar-divider" />
-          <div className="transform-tools" role="group" aria-label="Flip and rotate image">
+          <div className="transform-tools" role="group" aria-label="Flip, rotate and crop image">
             {IMAGE_TRANSFORMS.map(({ id, label, icon: Icon }) => (
               <button
                 key={id}
@@ -992,6 +1116,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
                 aria-label={label}
               ><Icon size={18} /></button>
             ))}
+            <button className="icon-button" disabled={working || saving} title="Crop and straighten (Alt+C)" aria-label="Crop and straighten" onClick={toggleCrop}><Crop size={18} /></button>
           </div>
           <span className="bar-divider" />
           <button className="icon-button" onClick={zoomOut} title="Zoom out (Numpad −)"><ZoomOut size={18} /></button>
@@ -1000,11 +1125,13 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
           <button className="icon-button" onClick={fitImage} title="Fit and center (Numpad *)"><Scan size={17} /></button>
         </div>
         <div className="editor-actions">
-          <button className="icon-button" disabled={working || saving} title="Crop and straighten (Alt+C)" aria-label="Crop and straighten" onClick={toggleCrop}><Crop size={18} /></button>
+          {immichStore && <button className={`icon-button ${immichVisible ? "active" : ""}`} title="Immich: favorite, rating, tags and albums" aria-label="Immich panel" aria-pressed={immichVisible}
+            onClick={() => { if (immichVisible) { setImmichOpen(false); } else { setImmichOpen(true); setWorkspaceOpen(false); } }}><Tags size={18} /></button>}
           <button className="icon-button" title="Edit history" aria-label="Edit history" onClick={() => { setWorkspaceTab("history"); setWorkspaceOpen(true); }}><History size={18} /></button>
           <button className="icon-button" title="Workflows and batch processing" aria-label="Workflows and batch processing" onClick={() => { setWorkspaceTab("workflows"); setWorkspaceOpen(true); }}><Layers size={18} /></button>
           <button className="icon-button" title="Export a copy" aria-label="Export a copy" onClick={() => { setWorkspaceTab("export"); setWorkspaceOpen(true); }}><Download size={18} /></button>
-          <button className="save-button" onClick={() => void save()} disabled={!dirty || saving || working}>
+          {image.path && <button className="icon-button danger" title="Delete this picture" aria-label="Delete this picture" disabled={working || saving || deleting} onClick={() => void deletePicture()}><Trash2 size={18} /></button>}
+          <button className="save-button" onClick={() => void save()} disabled={(!dirty && !!savePath) || saving || working}>
             {saving ? <LoaderCircle className="spin" size={17} /> : <Save size={17} />} Save
           </button>
           <button className="apply-button" onClick={() => void applyInpaint()} disabled={!maskDirty || working || saving || cropMode || selectingFace || compare || showOriginal}>
@@ -1063,6 +1190,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
 
           <ToolSection id="face-swap" title="Face swap" icon={UserRound}>
             <div className="denoise-control"><label htmlFor="face-color-match">Match face color <output>{faceColorMatch}%</output></label><input id="face-color-match" type="range" min="0" max="100" step="5" value={faceColorMatch} disabled={working || saving} onChange={(e) => setFaceColorMatch(+e.target.value)} /><div className="plugin-description">Matches brightness and skin tone to the target photo on the next replacement.</div></div>
+            <div className="face-source-row">
             <button
               className="face-photo-picker"
               onClick={() => void chooseFacePhoto()}
@@ -1073,6 +1201,10 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
               {activeFaceSource && <img src={activeFaceSource.data} alt="Selected face source" />}
               <span>{choosingFace ? "Loading…" : activeFaceSource ? "Change photo" : "Select photo"}</span>
             </button>
+            {faceLibrary.length > 0 && <FaceLibrary paths={faceLibrary} activePath={activeFaceSource?.path} busy={working || saving || choosingFace}
+              onUse={chooseSavedFace} onApply={(path) => void replaceFace(path)} onRemove={removeSavedFace} onAdd={() => void addFacePhotos()} />}
+            </div>
+            {activeFaceSource && <button className="plugin-run" onClick={clearFacePhoto} disabled={working || saving || choosingFace}><X size={13} /> Clear photo</button>}
             <button className="plugin-run" disabled={working || saving || !imageData} onClick={() => void detectFaces()}>Detect / choose a face<kbd className="action-shortcut">Alt+D</kbd></button>
             {faces.length > 0 && <><select aria-label="Target face" value={selectedFace?.id ?? "largest"} disabled={working || saving} onChange={(e) => { setSelectedFace(faces.find((face) => face.id === +e.target.value) ?? null); setSelectingFace(true); }}><option value="largest">Largest face</option>{faces.map((face) => <option key={face.id} value={face.id}>Face {face.id + 1}{assignments[face.id] ? " · assigned" : ""}</option>)}</select><button className="plugin-run" disabled={working || saving} onClick={() => setSelectingFace(!selectingFace)}>{selectingFace ? "Hide face boxes" : "Show face boxes"}</button></>}
             <button
@@ -1093,17 +1225,17 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
             ><Play size={13} /> Run GFPGAN<kbd className="action-shortcut">Alt+F</kbd></button>
           </ToolSection>
 
-          <ToolSection id="restormer" title="Restore detail · Restormer" icon={Sparkles}>
-            <select aria-label="Restormer restoration model" value={restormerModel} onChange={(event) => setRestormerModel(event.target.value)} disabled={working || saving}>
-              {RESTORMER_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
+          <ToolSection id="restore" title="Restore detail" icon={Sparkles}>
+            <select aria-label="Restoration mode" value={restoreMode} onChange={(event) => setRestoreMode(event.target.value)} disabled={working || saving}>
+              {RESTORE_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
             </select>
-            <div className="plugin-description">{selectedRestormer.description}</div>
-            <div className="denoise-control"><label htmlFor="restormer-strength">Restoration strength <output>{restormerStrength}%</output></label>
-              <input id="restormer-strength" type="range" min="0" max="100" step="5" value={restormerStrength} disabled={working || saving} onChange={(event) => setRestormerStrength(+event.target.value)} />
+            <div className="plugin-description">{selectedRestore.description}</div>
+            <div className="denoise-control"><label htmlFor="restore-strength">Restoration strength <output>{restoreStrength}%</output></label>
+              <input id="restore-strength" type="range" min="0" max="100" step="5" value={restoreStrength} disabled={working || saving} onChange={(event) => setRestoreStrength(+event.target.value)} />
               <div><span>Original</span><span>Restored</span></div>
             </div>
-            <div className="plugin-description">Keeps {dimensions.width} × {dimensions.height} px and transparency. Strength applies on the next run. Each model downloads about 100 MB on first use.</div>
-            <button className="plugin-run" disabled={!imageData || working || saving || restormerStrength === 0} onClick={() => void performOperation(restormerOperation)}><Play size={13} /> Restore detail<kbd className="action-shortcut">Alt+T</kbd></button>
+            <div className="plugin-description">Keeps {dimensions.width} × {dimensions.height} px and transparency. Strength applies on the next run. Downloads {selectedRestore.download} on first use.</div>
+            <button className="plugin-run" disabled={!imageData || working || saving || restoreStrength === 0} onClick={() => void performOperation(restoreOperation)}><Play size={13} /> Restore detail<kbd className="action-shortcut">Alt+T</kbd></button>
           </ToolSection>
 
           <ToolSection id="upscale" title="Upscale" icon={Maximize2}>
@@ -1255,12 +1387,13 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
         {workspaceOpen && <Workspace tab={workspaceTab} onTab={setWorkspaceTab} onClose={() => setWorkspaceOpen(false)}
           data={imageData} name={image.name} dimensions={dimensions} history={history.entries} position={history.position}
           onJump={jumpHistory} suggestions={suggestions} busy={working || saving} onBusy={setWorking} onMessage={setMessage} onRun={runWorkflow} />}
+        {immichVisible && immichStore && <ImmichPanel key={image.path} path={image.path} onClose={() => setImmichOpen(false)} />}
       </div>
       {pendingLeave && (
         <div className="leave-dialog-backdrop" role="presentation">
           <div className="leave-dialog" role="dialog" aria-modal="true" aria-labelledby="leave-dialog-title">
-            <strong id="leave-dialog-title">Save changes to {image.name}?</strong>
-            <p>Your edits have not been saved to the original file.</p>
+            <strong id="leave-dialog-title">Save changes to {displayName}?</strong>
+            <p>{pendingLeave.kind === "replace" ? "Another picture was sent to the editor. " : ""}Your edits have not been saved{savePath ? " to the original file" : ""}.</p>
             <div className="leave-dialog-actions">
               <button className="leave-no" onClick={() => void resolvePendingLeave(false)} disabled={saving}>
                 Don’t save <kbd>N</kbd>

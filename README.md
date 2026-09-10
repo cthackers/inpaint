@@ -15,10 +15,14 @@ model weights.
 ## Features
 
 - Folder tree and a responsive thumbnail gallery for large photo collections.
+- Image stores for folders laid out like Immich uploads, with Immich thumbnail refresh after saving.
+- Immich compatible though API and stores (see bellow)
+- Exposing HTTP API for all operations
+- Dropbox area where you can drag/drop files from browser/disk/clipboard and automatically save in stores (see bellow)
 - Mask painting with adjustable brush size, zoom, and pan.
 - Five selectable inpainting models for different kinds of repair.
 - GFPGAN face restoration, HAT/RealESRGAN upscaling, Lanczos resizing, and background removal tools.
-- Restormer detail restoration for defocus blur, motion blur, and noise without upscaling.
+- Detail restoration without upscaling: JPEG cleanup, added detail for soft pictures, noise removal, and motion deblurring.
 - Face replacement using a selected source photo, with a persistent InsightFace/INSwapper model.
 - Smart selection, clone/healing brushes, live color adjustments, crop/straighten, and canvas outpainting.
 - Background replacement with a color, another image, or a blurred background, plus cutout edge refinement.
@@ -62,13 +66,13 @@ aligned to the same frame.
 | --- | --- |
 | [![Real-HAT 2× upscale with updated output resolution](docs/screenshots/upscale.webp)](docs/screenshots/upscale.webp) | [![Original and upscaled cat image compared with a draggable divider](docs/screenshots/comparison.webp)](docs/screenshots/comparison.webp) |
 
-### Face restoration and Restormer detail restoration
+### Face restoration and detail restoration
 
-GFPGAN restores faces; Restormer offers separate models for defocus blur, motion
-blur, and noise. These captures show GFPGAN followed by Restormer's defocus
-model, with the portrait remaining 512 × 512 pixels.
+GFPGAN restores faces, and Restore detail cleans up compression and noise or adds
+detail at the same size. These captures show GFPGAN followed by the earlier
+Restormer defocus model, with the portrait remaining 512 × 512 pixels.
 
-| GFPGAN | Restormer |
+| GFPGAN | Restore detail |
 | --- | --- |
 | [![GFPGAN face restoration completed](docs/screenshots/gfpgan.webp)](docs/screenshots/gfpgan.webp) | [![Restormer defocus restoration completed at the original resolution](docs/screenshots/restormer.webp)](docs/screenshots/restormer.webp) |
 
@@ -127,6 +131,13 @@ navigation, painting, and action shortcuts; tool buttons also show their keys.
 ## Platform and hardware
 
 The application currently supports Linux only.
+
+The interface is drawn by WebKitGTK on the GPU. With NVIDIA's proprietary driver,
+WebKit's usual way of handing frames to the window shows a blank white window, so
+Inpaint passes them through shared memory there instead. If the window stays white
+or draws badly, start Inpaint with `INPAINT_RENDERER=software` (slower scrolling
+in large galleries), or with `INPAINT_RENDERER=gpu` to use WebKit's default. WebKit
+variables you set yourself, such as `WEBKIT_DISABLE_DMABUF_RENDERER`, are left alone.
 
 ### Portable deployment
 
@@ -370,19 +381,38 @@ To install those dependencies separately:
 
 ### Restore detail without upscaling
 
-**Restore detail · Restormer** (or **Alt+T**) restores the current image at its
-existing resolution. Choose **Out-of-focus blur**, **Motion blur**, or **Photo
-noise** to match the problem. Strength blends the restored result with the
-original and applies on the next run. Image dimensions and transparency are preserved.
+**Restore detail** (or **Alt+T**) repairs the current image at its existing
+resolution. Choose the mode that matches the picture:
 
-The [official Restormer models](https://github.com/swz30/Restormer/releases/tag/v1.0)
-are about 100 MiB each and download on first use into `models/restormer/`.
-Restormer processes overlapping tiles to limit GPU memory use. If it runs out
-of GPU memory, it tries smaller tiles, then falls back to the CPU. CPU processing
-is slower. The maximum input size is 64 megapixels, and severe blur may remain
-after restoration.
+| Mode | What it does | Downloads on first use |
+| --- | --- | --- |
+| **Compressed or soft photo** (default) | Removes JPEG blocks and ringing with [FBCNN](https://github.com/jiaxi-jiang/FBCNN), then adds detail with Real-ESRGAN 2× and shrinks the result back to the original size. Best for pictures saved from the web. | FBCNN (275 MiB), Real-ESRGAN 2× (64 MiB) |
+| **Natural detail** | FBCNN, then Real-HAT 4×, shrunk back. Finer, more natural detail; slower. | FBCNN, and Real-HAT (162 MiB) unless the upscaler already downloaded it |
+| **JPEG artifacts only** | FBCNN alone, without sharpening. | FBCNN |
+| **Photo noise** | Removes grain and color noise with [SCUNet](https://github.com/cszn/SCUNet), trained on real camera noise. | SCUNet (69 MiB) |
+| **Motion blur** | Restormer's motion deblurring model. | Restormer (100 MiB) |
 
-Restormer is included in the app's runtime, with its upstream MIT license.
+Strength blends the result with the original and applies on the next run.
+Image dimensions and transparency are preserved.
+
+Real-ESRGAN and Real-HAT were trained on realistically degraded photos, so
+enlarging a picture with them and shrinking the result back leaves sharper edges
+and texture at the original size. Measured against the clean originals of shrunk,
+JPEG-compressed and slightly blurred test photos, cleaning compression first and
+then adding detail came closest. Restormer's defocus and noise models, which this
+section used before, made compressed pictures worse and were removed; saved
+workflows and API requests that name them run **Compressed or soft photo** and
+**Photo noise** instead. Detail modes add plausible texture: they cannot bring
+back detail that is completely gone.
+
+Weights download into `models/restore/`; Real-HAT stays in
+`models/torch/hub/checkpoints/` and Restormer in `models/restormer/`. Networks
+stay loaded once used, so modes that share FBCNN load it once. They process
+overlapping tiles to limit GPU memory use; if the GPU runs out of memory, they
+retry with smaller tiles, then continue on the CPU, which is slower. The maximum
+input size is 64 megapixels.
+
+Restormer's architecture is included in the app's runtime, with its upstream MIT license.
 
 ### Face replacement
 
@@ -392,6 +422,11 @@ largest face in the source photo. In the target image, it replaces the face
 you selected, or the largest face if none is selected, then restores that area
 with GFPGAN. Replacement and restoration form one undoable edit and keep the
 image's dimensions and transparency. If no face is detected, choose a clearer photo.
+
+Every photo you choose is kept in **Saved faces**. Hover the tab beside the
+photo picker to open them in a column next to the panel. Click a photo to use it,
+**▷** to replace the face with that photo once without changing the one in use,
+or the bin to remove it from the list. **Add photos** saves several at once.
 
 The first-launch installer and main setup script include face replacement.
 To reinstall its dependencies in a source checkout:
@@ -409,6 +444,177 @@ before running the script.
 
 Face replacement uses [InsightFace's INSwapper](https://github.com/deepinsight/insightface/tree/master/examples/in_swapper).
 Model weights have their own upstream license terms.
+
+## Image stores
+
+An image store is a folder whose pictures are kept two levels deep under the
+first characters of their names, `ab/cd/abcd….jpg`, the way Immich stores
+uploads. Open the menu at the top of the browser's sidebar and choose **New
+store…**, pick the folder and name it. The menu then lists your stores below
+**Open folder…**.
+
+A store shows every PNG, JPG, WebP, GIF, BMP and TIFF picture of all its
+subfolders, newest first. Videos, sidecar files and files outside the layout
+are skipped and counted as other files. The sidebar shows the number of
+pictures, their size and the last scan, with **Rescan**, **Rename** and
+**Remove**. Remove only forgets the store; its folder stays on disk.
+
+Opening a store shows the list saved by its last scan at once and rescans in
+the background. The scan reads the top folders in parallel, so a store of
+30,000 pictures on a network share takes a few seconds. Thumbnails are cached
+in `.cache/thumbnails` in the data directory, up to 2 GB.
+
+Editing keeps a picture's file name, so a copy of the original still counts as
+a duplicate. GIF, BMP and TIFF pictures open as PNG and are saved as a new file.
+
+The bin in the editor's top bar deletes the open picture. It goes to the desktop
+trash; where there is none, as on some network shares, Inpaint asks before
+deleting it permanently. Pictures of Immich-compatible stores go to Immich's
+trash instead.
+
+### Immich
+
+For Immich, create a store from one user's upload folder, such as
+`/mnt/immich/upload/<user id>`, and check **Immich compatible** in its sidebar.
+**Folder as Immich sees it** is the same folder inside the Immich container,
+by default `/data/upload/<user id>`; Immich shows it as the file location of a
+picture. In **Settings** › **Immich**, enter the Immich address and an API key
+created by the account that owns the pictures, with the `asset.read`,
+`asset.update`, `asset.upload`, `asset.delete`, `job.create`, `tag.read`,
+`tag.create`, `tag.asset`, `album.read`, `album.create`, `albumAsset.create` and
+`albumAsset.delete` permissions.
+
+After Inpaint saves a picture of such a store, it finds the Immich asset by its
+path and asks Immich to rebuild the thumbnail, and to read the metadata again
+when the picture's size changed.
+
+In the editor, pictures of such a store get an **Immich** panel on the right,
+toggled with the tag button in the top bar. It shows and edits the favorite
+mark, archive, star rating and description, the picture's tags and albums
+(search the existing ones or create new ones; `Trips/2024` creates nested
+tags), and lists the people Immich recognized and the photo's details. Changes
+are saved to Immich at once; **Open in Immich** shows the picture there.
+
+## Drop box
+
+The drop box is a translucent area in a corner of the screen that saves
+pictures into an image store. Turn it on in **Settings** › **Drop box**, and
+choose the store, the screen, its size and its opacity.
+
+It stays invisible and lets clicks through until you hold **Win+Ctrl**: drag a
+picture from the browser, a file manager or any other program, hold the keys
+and drop it. While holding them, press **V** to save the picture on the
+clipboard. **Always visible** keeps it shown. Right-click it, or use the tray's
+**Drop box** menu, to change the store or save the clipboard.
+
+- Pictures dragged from Chromium-based browsers such as Vivaldi, or from
+  Firefox, are saved from the browser's own copy, so pictures behind a login
+  work too. Local files are copied, and dropped links are downloaded; a link to
+  a page saves the picture the page shows.
+- Only pictures are accepted. They are named after their SHA-1,
+  `ab/cd/<sha1>.jpg`, and a picture whose hash is already in the store is
+  skipped.
+- Immich-compatible stores get the picture uploaded through Immich, which files
+  it and skips pictures it already has.
+- The area flashes green when a picture is saved, amber when it was already
+  there, and red when saving failed, with the reason shown for a few seconds. Pictures saved into the
+  store open in the browser appear at once.
+
+Holding the keys needs an X11 session; on Wayland, keep the drop box always
+visible.
+
+## Local API server
+
+Other programs can send pictures to the running app over HTTP. Click
+**Settings** in the browser's sidebar to enable it, choose between
+`127.0.0.1` and all network interfaces, copy the access token, and allow the
+folders that requests may read and write.
+
+Every editor operation has an endpoint, such as `POST /upscale` or
+`POST /face-swap`. `POST /workflow/{name}` runs a saved workflow, `POST /load`
+opens a picture in the editor, and `POST /save` writes a picture to disk.
+Pictures can be sent as bytes, URLs or disk paths.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"image": "/home/me/Pictures/cat.jpg", "options": {"scale": 2}}' \
+  -o cat-2x.jpg http://127.0.0.1:7865/upscale
+```
+
+See the [API reference](docs/server-api.md) for every endpoint and option.
+
+## Browser extension
+
+`browser-extension/` holds an extension for Chromium browsers (Chrome, Vivaldi,
+Brave, Edge, Opera) that sends pictures from web pages and from Immich to Inpaint
+through the local API server, and shows the results in place. Its
+[README](browser-extension/src/inpaint/README.md) covers setup and use.
+
+### Install it unpacked
+
+No build is needed:
+
+1. Open `chrome://extensions` (`vivaldi://extensions` in Vivaldi).
+2. Turn on **Developer mode**.
+3. Click **Load unpacked** and choose the `browser-extension` folder.
+
+After changing the extension's files, click the reload button on its card. This
+is the easiest way while working on the extension.
+
+### Build a package
+
+```bash
+./build-extension.sh
+```
+
+The script needs only Node.js and writes two files to the project root:
+
+| File | Use |
+| --- | --- |
+| `inpaint-extension.crx` | Signed package, installed by dragging it onto the extensions page |
+| `inpaint-extension.zip` | The same files unsigned: unzip it and load the folder unpacked on another machine |
+
+To install the `.crx`, turn on **Developer mode** on the extensions page, drag
+the file onto the page and confirm. Chromium browsers on Linux accept this;
+Chrome on Windows and macOS only keeps extensions from the Chrome Web Store. To
+update, raise `version` in `browser-extension/manifest.json`, build again and
+drag in the new file. Its settings are kept.
+
+Every build has the same extension ID, so a new `.crx` updates the installed
+copy, and an unpacked copy uses the same ID and settings too. The ID comes from
+the `"key"` field in `manifest.json`, which is the public half of a signing key:
+
+- The first build creates the key at `~/.config/inpaint/extension-key.pem`,
+  writes its public half into `manifest.json`, and asks you to commit that change.
+- Later builds check that they sign with the matching key and stop otherwise, so
+  no package can come out with another ID.
+- Keep the key private and back it up. Without it, no update can be built for
+  installed copies. On another machine, copy it to the same place or pass `--key`.
+- Loading the folder unpacked needs no key, and it still gets the same ID.
+
+Options: `--key FILE` (or `INPAINT_EXTENSION_KEY`) signs with another key, and
+`--out FOLDER` writes the packages elsewhere. The build stops when
+`manifest.json` names a file that does not exist.
+
+Firefox is not supported. The extension runs its background code as a Chromium
+service worker, and release versions of Firefox only install `.xpi` packages
+signed by Mozilla.
+
+## System tray
+
+Inpaint shows a tray icon so it can keep serving API requests in the
+background. Its menu has **Start server** / **Stop server**, a **Minimize to
+tray** checkbox, a **Drop box** menu and **Exit**. With **Minimize to tray** checked (the default),
+closing or minimizing the window hides it in the tray; click the icon to bring
+it back. Unchecked, closing the window exits the app.
+
+Only one copy of Inpaint runs at a time. Starting it again brings the running
+window back, including from the tray, so a second copy never competes for the
+API server's port.
+
+The icon uses the StatusNotifierItem protocol, which KDE Plasma and most Linux
+desktops show natively. GNOME needs the AppIndicator extension. Without a tray,
+closing the window always exits.
 
 ## Editor controls
 

@@ -6,6 +6,9 @@ authors = ["Inpaint contributors"]
 license = "AGPL-3.0-only"
 edition = "2021"
 
+[features]
+flatpak = []
+
 [lib]
 name = "inpaint_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -22,6 +25,22 @@ base64 = "0.22"
 image = "0.25"
 tempfile = "3"
 flate2 = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+img-parts = "0.4"
+tokio = { version = "1", features = ["net", "sync", "time"] }
+getrandom = "0.3"
+ksni = "0.3"
+tauri-plugin-single-instance = "2"
+# Drop box: hashing, X11 key polling, clipboard and window hints through GTK, upload dates.
+sha1_smol = "1"
+x11-dl = "2"
+gtk = "0.18"
+url = "2"
+percent-encoding = "2"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# Web requests (downloads and Immich) in the app, trusting the system's certificates.
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # Thumbnail decoding remains responsive when ImageMagick is unavailable while
 # running `tauri dev`, whose dependencies would otherwise be unoptimized.

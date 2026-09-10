@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Inpaint integration</title>
+<link rel="stylesheet" href="options.css">
+</head>
+<body>
+<main>
+    <h1>Inpaint integration</h1>
+
+    <section>
+        <h2>Inpaint app</h2>
+        <p>In Inpaint, click <b>API server</b> in the folder browser, enable the server and copy its access token.</p>
+        <label>API address <input id="app-url" type="url" placeholder="http://127.0.0.1:7865"></label>
+        <label>Access token <input id="token" type="password" autocomplete="off"></label>
+        <div class="row"><button id="app-test">Save and test</button><span id="app-result" class="result"></span></div>
+    </section>
+
+    <section>
+        <h2>Immich</h2>
+        <p>Pictures on this Immich server are read through its API, as the account signed in on the Immich page. Saving writes an edit back to the library file when its folder is mapped below, then asks Immich to regenerate the thumbnail.</p>
+        <label>Immich address <input id="immich-url" type="url" placeholder="https://photos.example.com"></label>
+        <label>API key (optional) <input id="immich-key" type="password" autocomplete="off"></label>
+        <p class="hint">Only used when a request cannot go through the Immich page. Create it in Immich under Account Settings → API Keys with the permissions asset.read, asset.view, asset.download and job.create.</p>
+
+        <h3>Library folders</h3>
+        <p class="hint">Map the start of an asset's path as Immich shows it to the same folder mounted on this computer. Add the local folders to Inpaint's allowed folders as well. Edits of assets outside mapped folders go to Inpaint's save folder.</p>
+        <div id="mappings"></div>
+        <button id="add-mapping">Add folder</button>
+        <div class="row"><button id="immich-test">Save and test</button><span id="immich-result" class="result"></span></div>
+    </section>
+
+    <div class="row"><button id="save" class="primary">Save</button><span id="save-result" class="result"></span></div>
+
+    <section>
+        <h2>Using it</h2>
+        <p>Press <kbd>Alt+Shift+I</kbd> on a page, or right-click and choose <b>Inpaint panel</b>, then pick a picture: similar pictures on that site get a small Inpaint button. Hover it for the actions. Results replace the picture on the page until you save.</p>
+        <p>Right-click any picture and choose <b>Open in Inpaint</b> to edit it in the app.</p>
+    </section>
+</main>
+<script type="module" src="options.js"></script>
+</body>
+</html>

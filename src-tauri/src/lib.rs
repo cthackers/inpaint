@@ -3,18 +3,26 @@ use image::{codecs::jpeg::JpegEncoder, DynamicImage, ImageFormat};
 use serde::Serialize;
 use std::{
     fs,
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, LazyLock, Mutex},
 };
 use tempfile::Builder;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
+mod db;
+mod dropbox;
+mod http;
+mod immich;
 mod runtime;
+mod server;
+mod stores;
+mod tray;
 static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
 
 const INPAINT_SCRIPT: &str = include_str!("../../backend/inpaint.py");
 const FACE_SWAP_SCRIPT: &str = include_str!("../../backend/face_swap.py");
+const RESTORE_SCRIPT: &str = include_str!("../../backend/restore.py");
 const RESTORMER_SCRIPT: &str = include_str!("../../backend/restormer.py");
 const RESTORMER_ARCH_SCRIPT: &str = include_str!("../../backend/restormer_arch.py");
 const UPSCALE_SCRIPT: &str = include_str!("../../backend/upscale.py");
@@ -23,7 +31,7 @@ const ADVANCED_SCRIPT: &str = include_str!("../../backend/advanced.py");
 const DOWNLOADS_SCRIPT: &str = include_str!("../../backend/downloads.py");
 const PROTOCOL_SCRIPT: &str = include_str!("../../backend/worker_protocol.py");
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ImageEntry {
     name: String,
@@ -90,6 +98,13 @@ fn image_extension(path: &Path) -> Option<String> {
     matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp").then_some(extension)
 }
 
+/// Pictures the browser lists and the editor opens. GIF, BMP and TIFF open as PNG and cannot be
+/// written back, unlike the formats of `image_extension`.
+fn picture_extension(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff").then_some(extension)
+}
+
 #[tauri::command]
 fn list_folders(path: String) -> Result<Vec<FolderEntry>, String> {
     let mut folders = Vec::new();
@@ -116,7 +131,7 @@ fn list_directory(path: String) -> Result<DirectoryContents, String> {
         if file_type.is_dir() {
             folders.push(folder_entry(entry_path));
         } else if file_type.is_file() {
-            let Some(extension) = image_extension(&entry_path) else { continue };
+            let Some(extension) = picture_extension(&entry_path) else { continue };
             let metadata = entry.metadata().ok();
             let modified_ms = metadata
                 .as_ref()
@@ -157,91 +172,376 @@ fn decode_data_url(data: &str) -> Result<Vec<u8>, String> {
 }
 
 #[tauri::command]
-fn read_image_data(path: String) -> Result<String, String> {
-    let path = PathBuf::from(path);
-    let mime = mime_for(&path)?;
-    let data = fs::read(&path).map_err(|error| format!("Cannot read image: {error}"))?;
-    Ok(format!("data:{mime};base64,{}", BASE64.encode(data)))
+async fn read_image_data(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(path);
+        let data = fs::read(&path).map_err(|error| format!("Cannot read image: {error}"))?;
+        if let Ok(mime) = mime_for(&path) {
+            return Ok(format!("data:{mime};base64,{}", BASE64.encode(data)));
+        }
+        if picture_extension(&path).is_none() {
+            return Err("Only PNG, JPG, WebP, GIF, BMP and TIFF images are supported".into());
+        }
+        // The editor works on formats the webview shows and Save writes; other pictures open as
+        // PNG (a GIF as its first frame) and are saved as a new file.
+        let image = image::load_from_memory(&data).map_err(|error| format!("Cannot decode image: {error}"))?;
+        let png = encode_image(&image, ImageFormat::Png)?;
+        Ok(format!("data:image/png;base64,{}", BASE64.encode(png)))
+    })
+    .await
+    .map_err(|error| format!("Image task failed: {error}"))?
+}
+
+const THUMBNAIL_CACHE_LIMIT: u64 = 2 << 30;
+
+fn thumbnail_cache_dir() -> PathBuf {
+    project_dir().join(".cache/thumbnails")
+}
+
+/// Cached thumbnails are named after the picture's path, size and modification time, so an edited
+/// picture gets a new thumbnail.
+fn thumbnail_cache_file(path: &Path, metadata: &fs::Metadata) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    metadata.modified().ok().hash(&mut hasher);
+    thumbnail_cache_dir().join(format!("{:016x}.jpg", hasher.finish()))
+}
+
+/// Notes a cached thumbnail's size and last use in cache.db, which orders the cache for pruning.
+fn thumbnail_used(file: &str, bytes: usize) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_millis() as i64);
+    let result = db::cache_db().execute(
+        "INSERT INTO thumbnails (file, bytes, last_used) VALUES (?1, ?2, ?3)
+         ON CONFLICT(file) DO UPDATE SET bytes = excluded.bytes, last_used = excluded.last_used",
+        rusqlite::params![file, bytes as i64, now],
+    );
+    if let Err(error) = result {
+        eprintln!("Cannot note the thumbnail: {error}");
+    }
+}
+
+/// Deletes the least recently used thumbnails while the cache is over its limit. Runs at startup and
+/// after each new thumbnail.
+fn prune_thumbnail_cache() {
+    let connection = db::cache_db();
+    let total: i64 = connection.query_row("SELECT COALESCE(SUM(bytes), 0) FROM thumbnails", [], |row| row.get(0)).unwrap_or(0);
+    if total as u64 <= THUMBNAIL_CACHE_LIMIT {
+        return;
+    }
+    let oldest: Vec<(String, i64)> = connection
+        .prepare("SELECT file, bytes FROM thumbnails ORDER BY last_used")
+        .and_then(|mut statement| statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect())
+        .unwrap_or_default();
+    let mut remaining = total as u64;
+    for (file, bytes) in oldest {
+        if remaining <= THUMBNAIL_CACHE_LIMIT / 10 * 8 {
+            break;
+        }
+        let _ = fs::remove_file(thumbnail_cache_dir().join(&file));
+        let _ = connection.execute("DELETE FROM thumbnails WHERE file = ?1", [&file]);
+        remaining = remaining.saturating_sub(bytes as u64);
+    }
+}
+
+/// A picture's thumbnail, a JPEG of at most 480×360, from the disk cache or made now.
+fn thumbnail_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let extension = picture_extension(path).ok_or("Only PNG, JPG, WebP, GIF, BMP and TIFF images are supported")?;
+    let metadata = fs::metadata(path).map_err(|error| format!("Cannot read image: {error}"))?;
+    let cached = thumbnail_cache_file(path, &metadata);
+    let file_name = cached.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    if let Ok(bytes) = fs::read(&cached) {
+        thumbnail_used(&file_name, bytes.len());
+        return Ok(bytes);
+    }
+    let thumbnail = THUMBNAIL_MAKERS.run(|| make_thumbnail(path, &extension))?;
+    if fs::create_dir_all(thumbnail_cache_dir()).is_ok() && replace_file(&cached, &thumbnail).is_ok() {
+        thumbnail_used(&file_name, thumbnail.len());
+        prune_thumbnail_cache();
+    }
+    Ok(thumbnail)
 }
 
 #[tauri::command]
 async fn read_thumbnail_data(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || thumbnail_bytes(Path::new(&path)).map(|bytes| format!("data:image/jpeg;base64,{}", BASE64.encode(bytes))))
+        .await
+        .map_err(|error| format!("Thumbnail task failed: {error}"))?
+}
+
+/// Serves `thumb://localhost/<percent-encoded path>?v=<size>-<modified>`. The gallery loads thumbnails as
+/// ordinary images, which the webview decodes off its main thread and caches; the query changes the
+/// address whenever the picture changes, so a cached copy is never stale.
+fn thumbnail_response(request: &tauri::http::Request<Vec<u8>>) -> tauri::http::Response<Vec<u8>> {
+    let path = percent_encoding::percent_decode_str(request.uri().path().trim_start_matches('/')).decode_utf8_lossy().into_owned();
+    let response = tauri::http::Response::builder();
+    match thumbnail_bytes(Path::new(&path)) {
+        Ok(bytes) => response.header("Content-Type", "image/jpeg").header("Cache-Control", "max-age=31536000, immutable").body(bytes),
+        Err(error) => response.status(404).header("Content-Type", "text/plain").body(error.into_bytes()),
+    }
+    .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
+}
+
+/// Limits how many thumbnails are made at once; cached ones never wait.
+struct Workers {
+    free: Mutex<usize>,
+    released: Condvar,
+}
+
+struct Permit<'a>(&'a Workers);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+        self.0.released.notify_one();
+    }
+}
+
+impl Workers {
+    fn run<T>(&self, work: impl FnOnce() -> T) -> T {
+        let mut free = self.free.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *free == 0 {
+            free = self.released.wait(free).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *free -= 1;
+        drop(free);
+        let _permit = Permit(self);
+        work()
+    }
+}
+
+// ImageMagick runs single-threaded per thumbnail, so this many processes use this many cores.
+static THUMBNAIL_MAKERS: LazyLock<Workers> = LazyLock::new(|| Workers {
+    free: Mutex::new(std::thread::available_parallelism().map_or(4, |cores| cores.get()).clamp(2, 16)),
+    released: Condvar::new(),
+});
+
+fn make_thumbnail(path: &Path, extension: &str) -> Result<Vec<u8>, String> {
+    // ImageMagick is heavily optimized even while this app is running as a
+    // development build. Prefer it for previews; retain the image-crate
+    // path so packaged builds still work when ImageMagick is unavailable.
+    let mut source = path.as_os_str().to_owned();
+    if matches!(extension, "gif" | "tif" | "tiff") {
+        // Only the first frame or page.
+        source.push("[0]");
+    }
+    if let Ok(result) = Command::new("magick")
+        .env("MAGICK_THREAD_LIMIT", "1")
+        .args(["-define", "jpeg:size=960x720"])
+        .arg(&source)
+        .args([
+            "-auto-orient",
+            "-thumbnail",
+            "480x360>",
+            "-strip",
+            "-quality",
+            "82",
+            "jpeg:-",
+        ])
+        .output()
+    {
+        if result.status.success() && !result.stdout.is_empty() {
+            return Ok(result.stdout);
+        }
+    }
+
+    let image = image::open(path)
+        .map_err(|error| format!("Cannot decode thumbnail: {error}"))?;
+    let thumbnail = image.thumbnail(480, 360).to_rgb8();
+    let mut output = Vec::new();
+    JpegEncoder::new_with_quality(&mut output, 82)
+        .encode_image(&thumbnail)
+        .map_err(|error| format!("Cannot encode thumbnail: {error}"))?;
+    Ok(output)
+}
+
+fn image_format_for(path: &Path) -> Result<ImageFormat, String> {
+    match image_extension(path).as_deref() {
+        Some("png") => Ok(ImageFormat::Png),
+        Some("jpg" | "jpeg") => Ok(ImageFormat::Jpeg),
+        Some("webp") => Ok(ImageFormat::WebP),
+        _ => Err("Only PNG, JPG, JPEG, and WebP images are supported".into()),
+    }
+}
+
+fn encode_image(image: &DynamicImage, format: ImageFormat) -> Result<Vec<u8>, String> {
+    let mut output = std::io::Cursor::new(Vec::new());
+    match format {
+        ImageFormat::Jpeg => JpegEncoder::new_with_quality(&mut output, 95)
+            .encode_image(&DynamicImage::ImageRgb8(image.to_rgb8())),
+        other => image.write_to(&mut output, other),
+    }
+    .map_err(|error| format!("Cannot encode image: {error}"))?;
+    Ok(output.into_inner())
+}
+
+/// Copies EXIF data (capture date, camera, GPS) from `original` into `encoded`.
+/// Edited pixels are already upright, so the orientation tag is reset.
+fn copy_metadata(encoded: Vec<u8>, original: &[u8]) -> Vec<u8> {
+    use img_parts::{Bytes, DynImage, ImageEXIF};
+    let Some(exif) = DynImage::from_bytes(Bytes::copy_from_slice(original))
+        .ok()
+        .flatten()
+        .and_then(|image| image.exif())
+    else {
+        return encoded;
+    };
+    let Ok(Some(mut image)) = DynImage::from_bytes(Bytes::from(encoded.clone())) else {
+        return encoded;
+    };
+    let mut exif = exif.to_vec();
+    reset_orientation(&mut exif);
+    image.set_exif(Some(Bytes::from(exif)));
+    let mut output = Vec::with_capacity(encoded.len() + 4096);
+    match image.encoder().write_to(&mut output) {
+        Ok(_) => output,
+        Err(_) => encoded,
+    }
+}
+
+fn reset_orientation(exif: &mut [u8]) {
+    let start = if exif.starts_with(b"Exif\0\0") { 6 } else { 0 };
+    let tiff = &mut exif[start..];
+    let little = match tiff.get(..2) {
+        Some([b'I', b'I']) => true,
+        Some([b'M', b'M']) => false,
+        _ => return,
+    };
+    let read = |bytes: &[u8], at: usize, size: usize| -> Option<usize> {
+        let field = bytes.get(at..at.checked_add(size)?)?;
+        Some(field.iter().enumerate().fold(0, |value, (index, byte)| {
+            let shift = 8 * if little { index } else { size - 1 - index };
+            value | (*byte as usize) << shift
+        }))
+    };
+    let Some(directory) = read(tiff, 4, 4) else { return };
+    let Some(count) = read(tiff, directory, 2) else { return };
+    for entry in (0..count).map(|index| directory + 2 + index * 12) {
+        if read(tiff, entry, 2) == Some(0x0112) {
+            if let Some(value) = tiff.get_mut(entry + 8..entry + 10) {
+                value.copy_from_slice(if little { &[1, 0] } else { &[0, 1] });
+            }
+            return;
+        }
+    }
+}
+
+/// Replaces `path` atomically so an interrupted save never leaves a truncated picture.
+fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut file = Builder::new()
+        .prefix(".inpaint-save-")
+        .tempfile_in(parent)
+        .map_err(|error| format!("Cannot write image: {error}"))?;
+    file.write_all(bytes).map_err(|error| format!("Cannot write image: {error}"))?;
+    let permissions = fs::metadata(path)
+        .map(|metadata| metadata.permissions())
+        .unwrap_or_else(|_| fs::Permissions::from_mode(0o644));
+    file.as_file().set_permissions(permissions).map_err(|error| format!("Cannot write image: {error}"))?;
+    file.as_file().sync_all().map_err(|error| format!("Cannot write image: {error}"))?;
+    file.persist(path).map_err(|error| format!("Cannot replace image: {}", error.error))?;
+    Ok(())
+}
+
+/// Saves the edited picture. Returns a note to show when the picture belongs to an Immich-compatible
+/// image store, whose thumbnail Immich is then asked to rebuild.
+#[tauri::command]
+async fn save_image(path: String, image_data: String) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = PathBuf::from(path);
-        mime_for(&path)?;
-
-        // ImageMagick is heavily optimized even while this app is running as a
-        // development build. Prefer it for previews; retain the image-crate
-        // path so packaged builds still work when ImageMagick is unavailable.
-        if let Ok(result) = Command::new("magick")
-            .args(["-define", "jpeg:size=960x720"])
-            .arg(&path)
-            .args([
-                "-auto-orient",
-                "-thumbnail",
-                "480x360>",
-                "-strip",
-                "-quality",
-                "82",
-                "jpeg:-",
-            ])
-            .output()
-        {
-            if result.status.success() && !result.stdout.is_empty() {
-                return Ok(format!(
-                    "data:image/jpeg;base64,{}",
-                    BASE64.encode(result.stdout)
-                ));
-            }
+        let format = image_format_for(&path)?;
+        let bytes = decode_data_url(&image_data)?;
+        let image = image::load_from_memory(&bytes).map_err(|error| format!("Cannot decode edited image: {error}"))?;
+        let previous_size = image::image_dimensions(&path).ok();
+        let mut encoded = encode_image(&image, format)?;
+        // Keep capture dates and locations so photo libraries still place the picture correctly.
+        if let Ok(original) = fs::read(&path) {
+            encoded = copy_metadata(encoded, &original);
         }
-
-        let image = image::open(&path)
-            .map_err(|error| format!("Cannot decode thumbnail: {error}"))?;
-        let thumbnail = image.thumbnail(480, 360).to_rgb8();
-        let mut output = Vec::new();
-        JpegEncoder::new_with_quality(&mut output, 82)
-            .encode_image(&thumbnail)
-            .map_err(|error| format!("Cannot encode thumbnail: {error}"))?;
-        Ok(format!("data:image/jpeg;base64,{}", BASE64.encode(output)))
+        replace_file(&path, &encoded)?;
+        let size_changed = previous_size != Some((image.width(), image.height()));
+        let saved = fs::canonicalize(&path).unwrap_or(path);
+        stores::record_picture(&saved);
+        Ok(immich::refresh_saved_picture(&saved, size_changed))
     })
     .await
-    .map_err(|error| format!("Thumbnail task failed: {error}"))?
+    .map_err(|error| format!("Save task failed: {error}"))?
 }
 
-fn write_image(path: &Path, image: DynamicImage) -> Result<(), String> {
-    let extension = image_extension(path).ok_or_else(|| "Unsupported destination format".to_string())?;
-    let file = fs::File::create(path).map_err(|error| format!("Cannot overwrite image: {error}"))?;
-    let mut writer = BufWriter::new(file);
-    match extension.as_str() {
-        "jpg" | "jpeg" => JpegEncoder::new_with_quality(&mut writer, 95)
-            .encode_image(&DynamicImage::ImageRgb8(image.to_rgb8()))
-            .map_err(|error| format!("Cannot encode JPEG: {error}"))?,
-        "png" => image
-            .write_to(&mut writer, ImageFormat::Png)
-            .map_err(|error| format!("Cannot encode PNG: {error}"))?,
-        "webp" => image
-            .write_to(&mut writer, ImageFormat::WebP)
-            .map_err(|error| format!("Cannot encode WebP: {error}"))?,
-        _ => return Err("Unsupported destination format".into()),
-    }
-    writer.flush().map_err(|error| format!("Cannot finish writing image: {error}"))
+fn image_entry(path: &Path) -> Option<ImageEntry> {
+    let extension = picture_extension(path)?;
+    let metadata = fs::metadata(path).ok().filter(|metadata| metadata.is_file())?;
+    Some(ImageEntry {
+        name: path.file_name()?.to_string_lossy().into_owned(),
+        path: path_string(path),
+        extension,
+        size: metadata.len(),
+        modified_ms: stores::modified_ms(&metadata),
+    })
 }
 
+#[derive(Serialize)]
+struct Deletion {
+    /// False when the trash was unavailable; the message then says why.
+    deleted: bool,
+    message: String,
+}
+
+/// Deletes a picture: through Immich for Immich-compatible stores, otherwise into the desktop trash.
+/// `permanent` removes the file for good, for when the trash is unavailable, as on some network shares.
 #[tauri::command]
-fn save_image(path: String, image_data: String) -> Result<(), String> {
-    let path = PathBuf::from(path);
-    mime_for(&path)?;
-    let bytes = decode_data_url(&image_data)?;
-    let image = image::load_from_memory(&bytes).map_err(|error| format!("Cannot decode edited image: {error}"))?;
-    write_image(&path, image)
+async fn delete_image(path: String, permanent: bool) -> Result<Deletion, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = PathBuf::from(&path);
+        if picture_extension(&file).is_none() || !file.is_file() {
+            return Err(format!("{path} is not a picture."));
+        }
+        let canonical = fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+        if let Some(result) = immich::trash_picture(&canonical) {
+            if result.is_ok() {
+                stores::forget_picture(&canonical);
+            }
+            return result.map(|message| Deletion { deleted: true, message });
+        }
+        if permanent {
+            fs::remove_file(&file).map_err(|error| format!("Cannot delete {path}: {error}"))?;
+            stores::forget_picture(&canonical);
+            return Ok(Deletion { deleted: true, message: "Deleted.".into() });
+        }
+        // GLib's trash, as file managers use it, including the trash folders of other drives.
+        use gtk::gio::prelude::FileExt;
+        match gtk::gio::File::for_path(&file).trash(gtk::gio::Cancellable::NONE) {
+            Ok(()) => {
+                stores::forget_picture(&canonical);
+                Ok(Deletion { deleted: true, message: "Moved to the trash.".into() })
+            }
+            Err(error) => Ok(Deletion { deleted: false, message: format!("It cannot be moved to the trash: {error}") }),
+        }
+    })
+    .await
+    .map_err(|error| format!("Delete task failed: {error}"))?
+}
+
+/// Current details of pictures, such as ones just saved; None for pictures that are gone.
+#[tauri::command]
+fn image_entries(paths: Vec<String>) -> Vec<Option<ImageEntry>> {
+    paths.iter().map(|path| image_entry(Path::new(path))).collect()
 }
 
 fn python_executable() -> PathBuf {
+    #[cfg(feature = "flatpak")]
+    { PathBuf::from("/app/bin/python3.11") }
+
+    #[cfg(not(feature = "flatpak"))]
+    {
     let project_venv = project_dir().join(".venv/bin/python");
     if project_venv.is_file() {
         project_venv
     } else {
         PathBuf::from("python3")
+    }
     }
 }
 
@@ -269,6 +569,7 @@ impl ModelWorker {
             .map_err(|error| format!("Cannot prepare face-swap worker: {error}"))?;
         fs::write(runtime_dir.join("upscale.py"), UPSCALE_SCRIPT)
             .map_err(|error| format!("Cannot prepare upscaling worker: {error}"))?;
+        fs::write(runtime_dir.join("restore.py"), RESTORE_SCRIPT).map_err(|e| e.to_string())?;
         fs::write(runtime_dir.join("restormer.py"), RESTORMER_SCRIPT).map_err(|e| e.to_string())?;
         fs::write(runtime_dir.join("restormer_arch.py"), RESTORMER_ARCH_SCRIPT).map_err(|e| e.to_string())?;
         fs::write(runtime_dir.join("editing.py"), EDITING_SCRIPT)
@@ -532,7 +833,7 @@ async fn run_plugin(
 ) -> Result<String, String> {
     let worker_state = state.worker.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if !matches!(plugin.as_str(), "gfpgan" | "realesrgan" | "remove_bg" | "face_swap" | "hat" | "lanczos" | "restormer") {
+        if !matches!(plugin.as_str(), "gfpgan" | "realesrgan" | "remove_bg" | "face_swap" | "hat" | "lanczos" | "restore") {
             return Err(format!("Unsupported image plugin: {plugin}"));
         }
         if !scale.is_finite() || !(1.0..=4.0).contains(&scale) {
@@ -546,8 +847,8 @@ async fn run_plugin(
         if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
             return Err("Restoration strength must be between 0 and 1".into());
         }
-        if plugin == "restormer" && (scale != 1.0 || !matches!(option.as_str(), "motion" | "defocus" | "denoise")) {
-            return Err("Choose a supported Restormer model at its original resolution".into());
+        if plugin == "restore" && (scale != 1.0 || !matches!(option.as_str(), "compressed" | "natural" | "jpeg" | "noise" | "motion")) {
+            return Err("Choose a supported Restore detail mode at the original resolution".into());
         }
         let work_dir = Builder::new()
             .prefix("inpaint-plugin-")
@@ -623,6 +924,27 @@ async fn image_action(
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// WebKitGTK renders the UI on the GPU and hands finished frames to the window as DMA-BUF GPU buffers.
+/// With NVIDIA's proprietary driver those buffers show a blank white window, so there frames travel through
+/// shared memory instead, which keeps GPU rendering and compositing. Measured scrolling the gallery at 4K
+/// on NVIDIA: 42 fps this way, 12 fps with the DMA-BUF renderer disabled (the earlier workaround), and a
+/// white window with DMA-BUF buffers. `INPAINT_RENDERER=gpu|shared-memory|software` chooses explicitly;
+/// WebKit switches set by the user are left alone. PyTorch/CUDA inference is not affected.
+#[cfg(target_os = "linux")]
+fn configure_webkit_renderer() {
+    const SWITCHES: [&str; 3] = ["WEBKIT_DISABLE_DMABUF_RENDERER", "WEBKIT_DMABUF_RENDERER_FORCE_SHM", "WEBKIT_DISABLE_COMPOSITING_MODE"];
+    if SWITCHES.iter().any(|name| std::env::var_os(name).is_some()) {
+        return;
+    }
+    let nvidia = Path::new("/proc/driver/nvidia/version").exists();
+    let choice = std::env::var("INPAINT_RENDERER").unwrap_or_else(|_| if nvidia { "shared-memory" } else { "gpu" }.to_string());
+    match choice.as_str() {
+        "gpu" => {}
+        "software" => std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
+        _ => std::env::set_var("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1"),
+    }
+}
+
 pub fn run() {
     let context = tauri::generate_context!();
     if std::env::args().nth(1).as_deref() == Some("--check-assets") {
@@ -648,24 +970,57 @@ pub fn run() {
         return;
     }
 
-    // WebKitGTK's DMA-BUF renderer can produce a blank window with NVIDIA's
-    // proprietary driver. This only affects the UI webview; PyTorch/CUDA
-    // inference continues to use the GPU normally.
     #[cfg(target_os = "linux")]
-    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    configure_webkit_renderer();
 
     let worker_state = InpaintWorkerState::default();
     let shutdown_state = worker_state.clone();
     let app = tauri::Builder::default()
+        // Starting Inpaint again brings back the running window, even from the tray, instead of
+        // a second copy whose API server could not get the port. Must be the first plugin.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| tray::show_window(app)))
         .manage(worker_state)
         .manage(runtime::SetupState::default())
+        .manage(server::ServerState::default())
+        .manage(tray::TrayState::default())
+        .manage(stores::StoresState::default())
+        .manage(dropbox::DropboxState::default())
         .plugin(tauri_plugin_dialog::init())
+        .register_asynchronous_uri_scheme_protocol("thumb", |_context, request, responder| {
+            tauri::async_runtime::spawn_blocking(move || responder.respond(thumbnail_response(&request)));
+        })
+        .setup(|app| {
+            dropbox::start(app.handle());
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // With a tray icon, closing or minimizing hides the window and the app keeps running.
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" && tray::keeps_running(window.app_handle()) => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                // The drop box window would keep the app running, so closing the main window exits.
+                tauri::WindowEvent::CloseRequested { .. } if window.label() == "main" => window.app_handle().exit(0),
+                // Linux reports minimizing as a resize. Clearing the minimized state after hiding
+                // lets the tray show a normal window again instead of a minimized one.
+                tauri::WindowEvent::Resized(_)
+                    if window.label() == "main" && window.is_minimized().unwrap_or(false) && tray::keeps_running(window.app_handle()) =>
+                {
+                    let _ = window.hide();
+                    let _ = window.unminimize();
+                }
+                _ => {}
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             list_directory,
             list_folders,
             read_image_data,
             read_thumbnail_data,
             save_image,
+            image_entries,
+            delete_image,
             loaded_models,
             loaded_plugins,
             run_inpaint,
@@ -676,10 +1031,45 @@ pub fn run() {
             runtime::hf_token_status,
             runtime::save_hf_token,
             runtime::open_model_access,
+            server::server_status,
+            server::server_configure,
+            server::server_new_token,
+            server::server_bridge,
+            server::server_take_job,
+            server::server_job_result,
+            db::preferences_all,
+            db::preferences_set,
+            db::preferences_import,
+            stores::stores_list,
+            stores::store_create,
+            stores::store_update,
+            stores::store_remove,
+            stores::store_cached,
+            stores::store_scan,
+            immich::immich_settings,
+            immich::immich_configure,
+            immich::immich_test,
+            immich::immich_asset,
+            immich::immich_catalog,
+            immich::immich_update,
+            immich::immich_tag,
+            immich::immich_create_tag,
+            immich::immich_album,
+            immich::immich_create_album,
+            immich::immich_open,
+            dropbox::dropbox_status,
+            dropbox::dropbox_configure,
+            dropbox::dropbox_set,
+            dropbox::dropbox_overlay_state,
+            dropbox::dropbox_save_clipboard,
+            dropbox::dropbox_open_settings,
         ])
         .build(context)
         .expect("error while building Inpaint");
     let _ = APP_HANDLE.set(app.handle().clone());
+    std::thread::spawn(prune_thumbnail_cache);
+    server::start_saved(app.handle());
+    tray::start(app.handle());
 
     app.run(move |_app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {

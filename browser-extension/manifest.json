@@ -1,0 +1,47 @@
+{
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjvHW94ypLKOPEj6U+2Ao9ro7A1cQ1ddDgCk4M6uYFqEKjPIugbATcTIFheoyHkKGDc7nSLNw/wwfzdGhygRZ/3AvpnEzkbZ1FeaQvHwqFG48N0+VehuhZBeyFrZ74eUzW8HrDh+gi/M6Zqp6+c/RPRqeMw4N3hwOMhd9/E+lnUT6dCdrlATRBZJycmdlKMo0DdsfG7w+DQoVXnIk6yxeT+Jt+tPUO6Qz8D6VThLQKjnlrp0rFsrrVgIJZptykN1TbDOPCI5o8gT5KlUNC+uKFanpDwSPk6Ol2f6TPxTkmbnKmHjxVoxwGVazwI7UNuB3mPyO9aDQvPEn9eHIPQnaywIDAQAB",
+  "manifest_version": 3,
+  "name": "Inpaint",
+  "description": "Inpaint integration extension",
+  "version": "1.0",
+  "icons": {
+    "32": "icon.png"
+  },
+  "permissions": [
+    "contextMenus",
+    "storage",
+    "activeTab",
+    "scripting",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "src/inpaint/background.js",
+    "type": "module"
+  },
+  "options_page": "src/inpaint/options.html",
+  "commands": {
+    "toggle-inpaint-panel": {
+      "suggested_key": { "default": "Alt+Shift+I" },
+      "description": "Show or hide the Inpaint panel"
+    }
+  },
+  "content_scripts": [
+    {
+      "js": ["src/inpaint/content.js", "src/inpaint/panel.js"],
+      "matches": [
+        "https://*/*",
+        "http://*/*"
+      ]
+    },
+    {
+      "js": ["src/scripts/image-upgrade.js"],
+      "matches": [
+        "https://*/*",
+        "http://*/*"
+      ]
+    }
+  ]
+}

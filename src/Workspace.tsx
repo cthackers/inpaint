@@ -6,6 +6,7 @@ import { executeOperation, imageAction, type ActionResult, type ExportSettings, 
 import type { HistoryEntry } from "./useEditHistory";
 import { usePreference } from "./preferences";
 import ToolSection from "./ToolSection";
+import { storage } from "./storage";
 
 export type WorkspaceTab = "history" | "workflows" | "batch" | "export" | "memory";
 type Workflow = { id: string; name: string; steps: Operation[] };
@@ -20,7 +21,7 @@ type Props = {
 };
 
 function readSaved<T>(key: string, fallback: T): T {
-  try { return JSON.parse(localStorage.getItem(key) ?? "null") ?? fallback; }
+  try { return JSON.parse(storage.getItem(key) ?? "null") ?? fallback; }
   catch { return fallback; }
 }
 const defaultExport: ExportSettings = { directory: "", format: "png", quality: 95, width: 0, height: 0, suffix: "_edited", matte: "#ffffff" };
@@ -53,13 +54,13 @@ export default function Workspace(props: Props) {
   const workflow = workflows.find((item) => item.id === selected);
 
   useEffect(() => {
-    try { localStorage.setItem("inpaint.export", JSON.stringify(settings)); }
+    try { storage.setItem("inpaint.export", JSON.stringify(settings)); }
     catch { onMessage("Export preferences could not be saved."); }
   }, [settings, onMessage]);
 
   const saveWorkflows = (items: Workflow[]) => {
     try {
-      localStorage.setItem("inpaint.workflows", JSON.stringify(items));
+      storage.setItem("inpaint.workflows", JSON.stringify(items));
       setWorkflows(items);
     } catch { onMessage("Could not save workflows: local storage is full."); }
   };

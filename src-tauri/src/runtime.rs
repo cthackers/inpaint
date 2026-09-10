@@ -1,8 +1,12 @@
-use std::{fs, io::{BufRead, BufReader, Read, Write}, path::PathBuf, process::{Command, Stdio}, sync::{Arc, Mutex}};
+use std::{fs, io::Write, path::PathBuf, process::Command, sync::{Arc, Mutex}};
+#[cfg(not(feature = "flatpak"))]
+use std::{io::{BufRead, BufReader, Read}, process::Stdio};
 use serde::Serialize;
 use tauri::State;
 
+#[cfg(not(feature = "flatpak"))]
 const UV: &[u8] = include_bytes!("../../resources/uv.gz");
+#[cfg(not(feature = "flatpak"))]
 const FACE_WHEEL: &[u8] = include_bytes!("../../resources/insightface-0.7.3-cp311-cp311-linux_x86_64.whl");
 
 #[derive(Clone, Default, Serialize)]
@@ -12,7 +16,16 @@ pub struct Status { pub running: bool, pub ready: bool, pub stage: String, pub l
 pub struct SetupState(pub Arc<Mutex<Status>>);
 
 fn is_ready(root: &PathBuf) -> bool {
+    #[cfg(feature = "flatpak")]
+    {
+        let _ = root;
+        super::python_executable().is_file()
+            && std::path::Path::new("/app/share/inpaint/runtime-ready").is_file()
+    }
+    #[cfg(not(feature = "flatpak"))]
+    {
     root.join(".venv/bin/python").is_file() && (!root.join(".runtime-managed").exists() || root.join(".runtime-ready").exists())
+    }
 }
 
 #[tauri::command]
@@ -24,6 +37,7 @@ pub fn runtime_status(state: State<'_, SetupState>) -> Result<Status, String> {
     Ok(status)
 }
 
+#[cfg(not(feature = "flatpak"))]
 fn run(uv: &PathBuf, root: &PathBuf, args: &[&str], stage: &str, state: &Arc<Mutex<Status>>) -> Result<(), String> {
     { let mut status = state.lock().unwrap(); status.stage = stage.into(); status.log.push(stage.into()); }
     let mut child = Command::new(uv).args(args)
@@ -47,6 +61,14 @@ fn run(uv: &PathBuf, root: &PathBuf, args: &[&str], stage: &str, state: &Arc<Mut
     Ok(())
 }
 
+#[cfg(feature = "flatpak")]
+#[tauri::command]
+pub async fn setup_runtime(state: State<'_, SetupState>, gpu: bool) -> Result<(), String> {
+    let _ = (state, gpu);
+    Err("The Flatpak includes its processing runtime. Update or reinstall the Flatpak to repair it.".into())
+}
+
+#[cfg(not(feature = "flatpak"))]
 #[tauri::command]
 pub async fn setup_runtime(state: State<'_, SetupState>, gpu: bool) -> Result<(), String> {
     let shared = state.0.clone();
