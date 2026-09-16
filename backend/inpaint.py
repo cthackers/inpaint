@@ -13,7 +13,7 @@ import traceback
 SDXL_MODEL = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
 LAMA_MODEL_URL = "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"
 ERASE_MODELS = {"mat", "zits", "migan"}
-PLUGIN_NAMES = {"restore", "gfpgan", "realesrgan", "remove_bg", "face_swap", "hat", "lanczos"}
+PLUGIN_NAMES = {"restore", "gfpgan", "realesrgan", "remove_bg", "face_swap", "hat", "lanczos", "photo"}
 
 
 def configure_cache(models_dir: Path) -> None:
@@ -142,6 +142,9 @@ def load_plugin(plugin_name: str, option: str):
         from restore import DetailRestorer
         cache = Path(os.environ["XDG_CACHE_HOME"])
         return DetailRestorer(cache / "restore", Path(os.environ["TORCH_HOME"]) / "hub/checkpoints", cache / "restormer"), "restore"
+    if plugin_name == "photo":
+        from upscale import PhotoUpscaler
+        return PhotoUpscaler(Path(os.environ["TORCH_HOME"]) / "hub/checkpoints", option), f"photo:{option}"
     if plugin_name in {"hat", "lanczos"}:
         from upscale import HatUpscaler, LanczosUpscaler
         if plugin_name == "lanczos":
@@ -204,7 +207,7 @@ def process_plugin(plugin_name, plugin, input_path, output_path, scale, donor_pa
     if plugin_name == "restore":
         plugin.restore(input_path, output_path, option, strength)
         return
-    if plugin_name in {"hat", "lanczos"}:
+    if plugin_name in {"hat", "lanczos", "photo"}:
         plugin.upscale(input_path, output_path, scale)
         return
     if plugin_name == "realesrgan" and hasattr(plugin, "set_denoise"):
@@ -315,6 +318,33 @@ def worker_main(models_dir: Path) -> None:
                 else:
                     {"mask_edit": mask_edit, "retouch": retouch, "refine_edges": refine_edges}[command](request["input"], request["output"], request["options"])
                 respond({"ok": True})
+                continue
+
+            if command == "watermark":
+                from watermark import WatermarkDetector
+                from editing import read_rgba
+                options = request["options"]
+                name = options.get("model", "lama")
+                if options.get("mode") not in {"detect", "remove"} or name not in {"lama", "mat", "zits", "migan", "sdxl"}:
+                    raise ValueError("Unsupported watermark request.")
+                if "watermark" not in plugins:
+                    progress("Preparing watermark detection", None, "Downloading Florence-2 (1.5 GB) on first use")
+                    plugins["watermark"] = WatermarkDetector()
+                progress("Looking for watermarks", None, "")
+                mask, found, accepted = plugins["watermark"].mask(request["input"], options)
+                if options["mode"] == "detect":
+                    mask.save(request["output"], "PNG")
+                elif accepted:
+                    if name not in models:
+                        models[name] = load_model(name)
+                    mask_path = Path(request["output"]).with_name("watermark-mask.png")
+                    mask.save(mask_path, "PNG")
+                    progress("Removing watermarks", None, "")
+                    process_image(name, models[name], Path(request["input"]), mask_path, Path(request["output"]), options.get("prompt", ""))
+                else:
+                    # Nothing to remove leaves the picture as it was.
+                    read_rgba(request["input"]).save(request["output"], "PNG")
+                respond({"ok": True, "found": found, "accepted": accepted})
                 continue
 
             if command == "outpaint":

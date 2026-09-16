@@ -1,31 +1,22 @@
 #!/usr/bin/env bash
+# Installs the processing runtime into .venv with Python 3.11, whatever Python the system has.
+# Usage: scripts/setup-model.sh [--cpu]   (default: NVIDIA CUDA 12.8)
 set -euo pipefail
+source "$(dirname -- "${BASH_SOURCE[0]}")/python-runtime.sh"
 
-project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-venv_dir="$project_dir/.venv"
-python_bin="${PYTHON_BIN:-}"
-
-if [[ -z "$python_bin" ]]; then
-  if command -v python3.11 >/dev/null 2>&1; then
-    python_bin="python3.11"
-  else
-    python_bin="python3"
-  fi
+backend=cu128
+if [[ "${1:-}" == "--cpu" ]]; then
+  backend=cpu
 fi
 
-"$python_bin" -m venv "$venv_dir"
-"$venv_dir/bin/python" -m pip install --upgrade pip wheel
-"$venv_dir/bin/python" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-"$venv_dir/bin/python" -m pip install simple-lama-inpainting
-"$venv_dir/bin/python" -m pip install iopaint==1.6.0
-"$venv_dir/bin/python" -m pip install \
-  "numpy==1.26.4" "Pillow==9.5.0" "onnxruntime==1.19.2" \
-  "scikit-image==0.24.0" "rembg==2.0.57"
-"$venv_dir/bin/python" -m pip install "spandrel==0.4.2" "gdown==5.2.0"
+ensure_venv
+uv_pip install --index-url "https://download.pytorch.org/whl/$backend" "${torch_packages[@]}"
+uv_pip install -r "$project_dir/resources/requirements.txt" "$face_wheel"
+use_headless_opencv
 
 # Install face tools as well; model weights remain on demand.
-"$project_dir/scripts/setup-face-swap.sh"
+FACE_SWAP_BACKEND="$backend" "$project_dir/scripts/setup-face-swap.sh"
 
-"$venv_dir/bin/python" -c 'import torch; print("PyTorch", torch.__version__); print("CUDA available:", torch.cuda.is_available()); print("Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")'
+"$venv_dir/bin/python" -c 'import sys; assert sys.version_info[:2] == (3, 11), sys.version; import numpy, torch, torchvision, cv2, PIL, onnxruntime, insightface, rembg, spandrel, iopaint, simple_lama_inpainting; print("Python", sys.version.split()[0], "· PyTorch", torch.__version__, "· NumPy", numpy.__version__); print("CUDA available:", torch.cuda.is_available())'
 
 echo "Model environment is ready. The LaMa weights will download automatically on the first removal."

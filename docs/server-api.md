@@ -138,13 +138,15 @@ model worker and wait for each other.
 | `face-swap` | `strength` 0–1 (1); `colorMatch` 0–1 (0); `target` `[x, y]` fractions (largest face) | `donor` (optional): the face to use; defaults to the face source photo selected in Inpaint |
 | `detect-faces` | none; returns `{ "ok": true, "data": [{ "id": 0, "box": [x, y, w, h] }] }` | |
 | `restore-faces` | `strength` 0–1 (1) | |
-| `upscale` | `method`: `RealESRGAN_x4plus`, `hat-sharper`, `realesr-general-x4v3`, `RealESRGAN_x4plus_anime_6B`, `lanczos` (`RealESRGAN_x4plus`); `scale` 2–4 (2); `denoise` 0–1 (0.25) | |
+| `upscale` | `method`: `realwebphoto-dat2`, `nomos2-hq-atd`, `RealESRGAN_x4plus`, `hat-sharper`, `realesr-general-x4v3`, `RealESRGAN_x4plus_anime_6B`, `lanczos` (`realwebphoto-dat2`); `scale` 2–4 (2); `denoise` 0–1 (0.25) | `realwebphoto-dat2` keeps photo texture and handles JPEG; `nomos2-hq-atd` gives the most detail on clean, uncompressed sources |
 | `restore-detail` | `model`: `compressed`, `natural`, `jpeg`, `noise`, `motion` (`compressed`); `strength` 0–1 (1) | Restormer's former names `defocus` and `denoise` mean `compressed` and `noise`. |
 | `remove-background` | `model`: `briaai/RMBG-1.4`, `u2net`, `u2net_human_seg`, `briaai/RMBG-2.0` (`briaai/RMBG-1.4`) | |
 | `replace-background` | `mode`: `color`, `image`, `blur` (`color`); `color` (`#ffffff`); `blur` 1–100 (20); `removeFirst` (`true`); `model` as above | `background` when `mode` is `image` |
 | `refine-edges` | `shrink` −16–16 (1); `soften` 0–10 (0.5); `decontaminate` 0–1 (0.5) | |
+| `remove-watermarks` | `prompts` phrases separated by commas (`watermark, watermark text, translucent text overlay`); `maxPercent` 1–100 (10); `model` (`lama`) | Florence-2 finds one box per phrase; boxes larger than `maxPercent` of the picture are skipped. Downloads Florence-2 (1.5 GB) on first use |
 | `outpaint` | `left`, `top`, `right`, `bottom` 0–4096 px (0, set at least one); `model` (`lama`); `prompt` | |
 | `adjust` | `exposure` −3–3 EV (0); `contrast`, `temperature`, `saturation`, `shadows`, `highlights` −100–100 (0) | |
+| `downscale` | `longest` 16–32768 px (2048); `filter` `lanczos`, `bicubic`, `box`, `hamming`, `bilinear` (`lanczos`) | Plain resampling; a picture already that small is returned unchanged |
 | `crop` | `rect` `[x, y, width, height]` fractions (`[0, 0, 1, 1]`); `angle` −45–45 (0) | |
 | `flip-horizontal`, `flip-vertical`, `rotate-left`, `rotate-right` | none | |
 

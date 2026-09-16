@@ -2,9 +2,12 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Copy, Eye, EyeOff, FolderOpen, FolderPlus, Images, Inbox, RefreshCw, Server, Settings as SettingsIcon, Trash2, X } from "lucide-react";
+import { Copy, Eye, EyeOff, FolderOpen, FolderPlus, Images, Inbox, Keyboard, RefreshCw, Server, Settings as SettingsIcon, Trash2, X } from "lucide-react";
 import DropboxTab from "./DropboxSettings";
+import ShortcutsTab from "./ShortcutSettings";
+import { HiddenTab } from "./HiddenDialog";
 import type { Store } from "./types";
+import Select from "./Select";
 
 type ServerSettings = { enabled: boolean; listenAll: boolean; port: number; token: string; allowedFolders: string[]; allowUrls: boolean; saveFolder: string };
 type ServerStatus = { settings: ServerSettings; running: boolean; address: string | null; error: string | null; saveFolder: string };
@@ -14,6 +17,8 @@ const TABS = [
   { id: "server", label: "API server", icon: Server },
   { id: "immich", label: "Immich", icon: Images },
   { id: "dropbox", label: "Drop box", icon: Inbox },
+  { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
+  { id: "hidden", label: "Hidden", icon: EyeOff },
 ] as const;
 export type SettingsTab = (typeof TABS)[number]["id"];
 
@@ -28,15 +33,17 @@ export function SettingsButton({ onOpen }: { onOpen: () => void }) {
     return () => { void listening.then((unlisten) => unlisten()); };
   }, []);
   const state = !status?.settings.enabled ? "API off" : status.running ? `API :${status.settings.port}` : "API error";
-  return <button className="server-toggle" onClick={onOpen} title="API server, Immich and drop box settings">
+  return <button className="server-toggle" onClick={onOpen} title="API server, Immich, drop box and shortcut settings">
     <SettingsIcon size={16} /><span>Settings</span>
     <small className={`server-state ${status?.running ? "on" : status?.error ? "error" : ""}`}>{state}</small>
   </button>;
 }
 
-type DialogProps = { tab: SettingsTab; onTab: (tab: SettingsTab) => void; onClose: () => void; stores: Store[] };
+type DialogProps = { tab: SettingsTab; onTab: (tab: SettingsTab) => void; onClose: () => void; stores: Store[]; revealed?: boolean };
 
-export function SettingsDialog({ tab, onTab, onClose, stores }: DialogProps) {
+export function SettingsDialog({ tab: asked, onTab, onClose, stores, revealed = false }: DialogProps) {
+  const tabs = TABS.filter((entry) => entry.id !== "hidden" || revealed);
+  const tab = tabs.some((entry) => entry.id === asked) ? asked : "server";
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
     window.addEventListener("keydown", closeOnEscape);
@@ -51,7 +58,7 @@ export function SettingsDialog({ tab, onTab, onClose, stores }: DialogProps) {
       </div>
       <div className="settings-body">
         <nav className="settings-tabs" role="tablist" aria-label="Settings sections">
-          {TABS.map(({ id, label, icon: Icon }) => <button key={id} role="tab" aria-selected={id === tab} className={id === tab ? "active" : ""} onClick={() => onTab(id)}>
+          {tabs.map(({ id, label, icon: Icon }) => <button key={id} role="tab" aria-selected={id === tab} className={id === tab ? "active" : ""} onClick={() => onTab(id)}>
             <Icon size={15} />{label}
           </button>)}
         </nav>
@@ -59,6 +66,8 @@ export function SettingsDialog({ tab, onTab, onClose, stores }: DialogProps) {
         <div className="settings-panel" role="tabpanel" hidden={tab !== "server"}><ServerTab /></div>
         <div className="settings-panel" role="tabpanel" hidden={tab !== "immich"}><ImmichTab /></div>
         <div className="settings-panel" role="tabpanel" hidden={tab !== "dropbox"}><DropboxTab stores={stores} /></div>
+        <div className="settings-panel" role="tabpanel" hidden={tab !== "shortcuts"}>{tab === "shortcuts" && <ShortcutsTab />}</div>
+        {revealed && <div className="settings-panel" role="tabpanel" hidden={tab !== "hidden"}>{tab === "hidden" && <HiddenTab />}</div>}
       </div>
     </div>
   </div>;
@@ -110,10 +119,10 @@ function ServerTab() {
     <div className="workspace-form">
       <label className="check-label"><input type="checkbox" checked={draft.enabled} disabled={busy} onChange={(e) => update({ enabled: e.target.checked })} /> Enable the API server</label>
       <div className="form-row">
-        <label>Listen on<select value={draft.listenAll ? "all" : "local"} disabled={busy} onChange={(e) => update({ listenAll: e.target.value === "all" })}>
+        <label>Listen on<Select value={draft.listenAll ? "all" : "local"} disabled={busy} onChange={(e) => update({ listenAll: e.target.value === "all" })}>
           <option value="local">This computer only · 127.0.0.1</option>
           <option value="all">All network interfaces · 0.0.0.0</option>
-        </select></label>
+        </Select></label>
         <label>Port<input type="number" min={1024} max={65535} value={draft.port} disabled={busy} onChange={(e) => update({ port: Math.round(+e.target.value) })} /></label>
       </div>
       {draft.listenAll && <small className="server-warning">Other devices on your network can reach the API. Requests still need the token, but plain HTTP sends the token and pictures unencrypted.</small>}

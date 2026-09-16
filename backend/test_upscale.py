@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 import torch
 
-from upscale import GeneralUpscaler, HatUpscaler, LanczosUpscaler
+from upscale import GeneralUpscaler, SpandrelUpscaler, LanczosUpscaler
 
 
 class UpscaleTests(unittest.TestCase):
@@ -33,7 +33,7 @@ class UpscaleTests(unittest.TestCase):
             def __call__(self, tensor):
                 return torch.nn.functional.interpolate(tensor, scale_factor=4, mode="nearest")
 
-        model = HatUpscaler.__new__(HatUpscaler)
+        model = SpandrelUpscaler.__new__(SpandrelUpscaler)
         model.model = NearestModel()
         model.device = torch.device("cpu")
         model.tile_size = 16

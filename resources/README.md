@@ -17,3 +17,19 @@ Weights are downloaded on demand from the author's v1.0 release:
 https://github.com/swz30/Restormer/releases/tag/v1.0
 The app uses the motion deblurring, single-image defocus deblurring, and real
 image denoising checkpoints. Dual-pixel/grayscale models are not used.
+
+## Watermark detection
+
+`backend/watermark.py` follows the approach of
+[WatermarkRemover-AI](https://github.com/D-Ogi/WatermarkRemover-AI) (MIT, © 2025 D-Ogi): Florence-2
+open-vocabulary detection boxes for text prompts become an inpainting mask. No code is bundled from it.
+Florence-2 is downloaded on first use from
+[microsoft/Florence-2-large](https://huggingface.co/microsoft/Florence-2-large) (MIT) at the pinned revision
+`21a599d414c4d928c9032694c424fb94458e3594`; its model code comes with the weights and runs with
+`trust_remote_code`.
+
+## Photo upscalers
+
+The Upscale tool's DAT2 and ATD options download, on first use, `4xRealWebPhoto_v4_dat2` and
+`4xNomos2_hq_atd` by Philip Hofmann ([Phhofm/models](https://github.com/Phhofm/models), CC-BY-4.0), pinned by
+SHA-256 in `backend/upscale.py`. They load through spandrel (DAT, MIT; ATD, Apache-2.0 architectures).

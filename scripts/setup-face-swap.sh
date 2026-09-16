@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname -- "${BASH_SOURCE[0]}")/python-runtime.sh"
 
-project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-python_bin="$project_dir/.venv/bin/python"
-if [[ ! -x "$python_bin" ]]; then
+if [[ ! -x "$venv_dir/bin/python" ]]; then
   echo "Run scripts/setup-model.sh first." >&2
   exit 1
 fi
+ensure_venv
 
-"$python_bin" -m pip install -r "$project_dir/backend/requirements-face-swap.txt"
+uv_pip install -r "$project_dir/resources/requirements.txt" "$face_wheel"
+use_headless_opencv
 
 # CPU and GPU distributions share the onnxruntime module; install only one.
-# Download first, so a network failure cannot remove the working runtime.
-wheel_dir="$(mktemp -d)"
-trap 'rm -rf -- "$wheel_dir"' EXIT
-"$python_bin" -m pip download --no-deps --dest "$wheel_dir" "onnxruntime-gpu==1.23.2"
-"$python_bin" -m pip uninstall -y onnxruntime
-"$python_bin" -m pip install --no-index --find-links "$wheel_dir" --no-deps --force-reinstall "onnxruntime-gpu==1.23.2"
+if [[ "${FACE_SWAP_BACKEND:-cu128}" != "cpu" ]]; then
+  uv_pip uninstall onnxruntime
+  uv_pip install --no-deps "onnxruntime-gpu==1.23.2"
+fi
 
-"$python_bin" - "$project_dir" <<'PY'
+"$venv_dir/bin/python" - "$project_dir" <<'PY'
 import os
 from pathlib import Path
 import shutil

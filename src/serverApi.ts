@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { executeOperation, imageAction, loadImage, RESTORE_MODES, RESTORMER_MODES, type Adjustments, type Operation, type Plugin, type Rect } from "./editorOperations";
+import { executeOperation, imageAction, loadImage, RESIZE_FILTERS, WATERMARK_PROMPTS, watermarkPrompts, RESTORE_MODES, RESTORMER_MODES, type Adjustments, type Operation, type Plugin, type Rect, type ResizeFilter } from "./editorOperations";
 import { INPAINT_MODELS } from "./models";
 import { FACE_SOURCE_PREFERENCE } from "./preferences";
 import { storage } from "./storage";
@@ -58,7 +58,7 @@ const run = (image: string, operation: Operation) => executeOperation(image, ope
 const INPAINT_IDS = INPAINT_MODELS.map((model) => model.id);
 const BACKGROUND_MODELS = ["briaai/RMBG-1.4", "u2net", "u2net_human_seg", "briaai/RMBG-2.0"];
 const UPSCALERS: Record<string, Plugin> = {
-  "hat-sharper": "hat", RealESRGAN_x4plus: "realesrgan", "realesr-general-x4v3": "realesrgan", RealESRGAN_x4plus_anime_6B: "realesrgan", lanczos: "lanczos",
+  "realwebphoto-dat2": "photo", "nomos2-hq-atd": "photo", "hat-sharper": "hat", RealESRGAN_x4plus: "realesrgan", "realesr-general-x4v3": "realesrgan", RealESRGAN_x4plus_anime_6B: "realesrgan", lanczos: "lanczos",
 };
 const TRANSFORMS = [
   ["flip-horizontal", "Flip horizontally"], ["flip-vertical", "Flip vertically"], ["rotate-left", "Rotate left 90°"], ["rotate-right", "Rotate right 90°"],
@@ -97,6 +97,19 @@ const OPERATIONS: Record<string, Spec> = {
     },
     run: (image, v, job) => invoke<string>("run_inpaint", { imageData: image, maskData: job.mask, model: v.model, prompt: v.prompt }),
   },
+  "remove-watermarks": {
+    summary: "Find watermarks with Florence-2 and remove them. prompts lists what to look for, separated by commas; boxes larger than maxPercent of the picture are left alone.",
+    fields: {
+      prompts: fromEditor({ type: "text", default: WATERMARK_PROMPTS.join(", ") }, () => savedJson("inpaint.watermarkPrompts")),
+      maxPercent: fromEditor(range(10, 1, 100), () => savedNumber("inpaint.watermarkMaxPercent")),
+      model: fromEditor(choice("lama", INPAINT_IDS), () => savedText("inpaint.model")),
+    },
+    run: (image, v) => {
+      const prompts = watermarkPrompts(v.prompts as string);
+      if (!prompts.length) throw new RequestError("prompts must name at least one thing to look for.");
+      return run(image, { kind: "watermark", label: "Remove watermarks", prompts, maxPercent: v.maxPercent as number, model: v.model as string });
+    },
+  },
   "face-swap": {
     summary: "Replace the largest face, or the face at target, with the largest face in the face source photo, then restore it with GFPGAN.",
     inputs: [{ name: "donor", required: false, description: "Photo with the face to use. Defaults to the face source photo selected in Inpaint." }],
@@ -125,9 +138,9 @@ const OPERATIONS: Record<string, Spec> = {
     run: (image, v) => run(image, { kind: "plugin", label: "GFPGAN", plugin: "gfpgan", option: "gfpgan", scale: 1, denoise: .25, strength: v.strength as number }),
   },
   upscale: {
-    summary: "Enlarge with Real-HAT, RealESRGAN, or Lanczos without AI. denoise applies to realesr-general-x4v3.",
+    summary: "Enlarge. realwebphoto-dat2 keeps photo texture and handles JPEG; nomos2-hq-atd gives the most detail on clean sources; Real-HAT, RealESRGAN, or Lanczos without AI. denoise applies to realesr-general-x4v3.",
     fields: {
-      method: fromEditor(choice("hat-sharper", Object.keys(UPSCALERS)), () => savedText("inpaint.upscaleModel")),
+      method: fromEditor(choice("realwebphoto-dat2", Object.keys(UPSCALERS)), () => savedText("inpaint.upscaleModel")),
       scale: fromEditor(range(2, 2, 4, true), () => savedNumber("inpaint.upscaleScale")),
       denoise: fromEditor(range(.25, 0, 1), () => savedNumber("inpaint.upscaleDenoise", 100)),
     },
@@ -202,6 +215,14 @@ const OPERATIONS: Record<string, Spec> = {
     run: (image, v) => run(image, {
       kind: "adjust", label: "Color and lighting", values: Object.fromEntries(["exposure", ...ADJUSTMENTS].map((key) => [key, v[key]])) as Adjustments,
     }),
+  },
+  downscale: {
+    summary: "Shrink so the longest side is at most longest pixels, with plain resampling. A smaller picture is left as it is.",
+    fields: {
+      longest: fromEditor(range(2048, 16, 32768, true), () => savedNumber("inpaint.downscaleLongest")),
+      filter: fromEditor(choice("lanczos", RESIZE_FILTERS.map((filter) => filter.id)), () => savedText("inpaint.downscaleFilter")),
+    },
+    run: (image, v) => run(image, { kind: "resize", label: "Downscale", longest: v.longest as number, filter: v.filter as ResizeFilter }),
   },
   crop: {
     summary: "Rotate by angle degrees, then keep rect: [x, y, width, height] as fractions of the image.",

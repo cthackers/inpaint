@@ -23,7 +23,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::{Cell, RefCell},
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fmt::Display,
     fs,
     io::{self, Read},
@@ -63,6 +63,8 @@ pub struct DropboxSettings {
     pub opacity: f64,
     /// The screen, by horizontal position: left, middle or right.
     pub monitor: String,
+    /// The album each store's dropped pictures join, by store id; a store without one adds to none.
+    pub albums: BTreeMap<String, String>,
 }
 
 impl Default for DropboxSettings {
@@ -76,6 +78,7 @@ impl Default for DropboxSettings {
             margin: 8,
             opacity: 0.2,
             monitor: "middle".into(),
+            albums: BTreeMap::new(),
         }
     }
 }
@@ -94,6 +97,10 @@ pub struct DropboxState {
     flash: AtomicUsize,
     fade: AtomicUsize,
     shown_opacity: Mutex<f64>,
+    /// Whether the drag emphasis was last shown, so a drag changes the window once rather than in steps.
+    emphasis_shown: AtomicBool,
+    /// Click-through as last set: 0 not yet, 1 off, 2 on. Setting it again restacks some window managers.
+    ignoring: std::sync::atomic::AtomicU8,
 }
 
 #[derive(Serialize)]
@@ -186,8 +193,15 @@ impl NativeDrop {
 }
 
 enum Outcome {
-    Saved(Option<ImageEntry>),
-    Duplicate,
+    Saved(Option<ImageEntry>, Placed),
+    Duplicate(Placed),
+}
+
+/// Where a saved picture ended up, so the drop box can add it to the store's album.
+#[derive(Debug)]
+enum Placed {
+    File(PathBuf),
+    Asset(String),
 }
 
 /// A file ready to be hashed and stored; `temp` is set when it was written for the drop.
@@ -228,6 +242,16 @@ fn validated(mut settings: DropboxSettings) -> Result<DropboxSettings, String> {
 pub fn start(app: &AppHandle) {
     let saved = super::db::setting("dropbox").and_then(Result::ok).and_then(|settings| validated(settings).ok()).unwrap_or_default();
     *app.state::<DropboxState>().settings.lock().unwrap() = saved;
+    // Development only: drops the files named in INPAINT_DEBUG_DROP_FILES after a while, as the drop box would.
+    #[cfg(debug_assertions)]
+    if let Some(files) = std::env::var_os("INPAINT_DEBUG_DROP_FILES") {
+        let (app, files) = (app.clone(), std::env::split_paths(&files).collect::<Vec<_>>());
+        let delay = std::env::var("INPAINT_DEBUG_DROP_DELAY").ok().and_then(|value| value.parse().ok()).unwrap_or(15);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(delay));
+            process(&app, files.into_iter().map(Item::File).collect());
+        });
+    }
     let handle = app.clone();
     if let Err(error) = std::thread::Builder::new().name("dropbox-keys".into()).spawn(move || watch_keys(handle)) {
         eprintln!("Cannot watch the drop box keys: {error}");
@@ -253,6 +277,16 @@ pub fn set_enabled(app: &AppHandle, enabled: bool) {
 
 pub fn set_pinned(app: &AppHandle, pinned: bool) {
     report_error(app, update(app, |settings| settings.pinned = pinned));
+}
+
+/// Moves the drop box to a store that is still shown when its own one was just hidden.
+pub fn leave_hidden_store(app: &AppHandle) {
+    let current = settings(app).store_id;
+    if current.is_empty() || stores::stores_list().iter().any(|store| store.id == current) {
+        return;
+    }
+    let next = stores::stores_list().into_iter().next().map(|store| store.id).unwrap_or_default();
+    report_error(app, update(app, |settings| settings.store_id = next));
 }
 
 pub fn set_store(app: &AppHandle, id: String) {
@@ -300,12 +334,27 @@ fn show_state(app: &AppHandle) {
     let state = overlay_state(app);
     let dropbox = app.state::<DropboxState>();
     if let Some(window) = app.get_webview_window(LABEL) {
-        let _ = window.set_ignore_cursor_events(!state.visible);
+        let ignore = if state.visible { 1 } else { 2 };
+        if dropbox.ignoring.swap(ignore, Ordering::SeqCst) != ignore {
+            debug_drop(format_args!("click-through {}", !state.visible));
+            let _ = window.set_ignore_cursor_events(!state.visible);
+        }
         let emphasized = state.dragging || dropbox.flashing.load(Ordering::SeqCst);
         let target = target_opacity(state.visible, settings(app).opacity, emphasized);
-        fade_to(app, &window, target);
+        // While something is dragged over it, the window changes once: stepping its opacity during a drag
+        // restacks it under the dragged picture on some window managers, which throws the drag around.
+        let drag_changed = dropbox.emphasis_shown.swap(state.dragging, Ordering::SeqCst) != state.dragging;
+        fade_to(app, &window, target, if drag_changed { 1 } else { FADE_STEPS });
     }
     let _ = app.emit_to(LABEL, "dropbox-state", state);
+}
+
+/// Traces the drop box's drag handling to stderr when INPAINT_DEBUG_DROPBOX is set.
+fn debug_drop(message: std::fmt::Arguments) {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("INPAINT_DEBUG_DROPBOX").is_some());
+    if *ON {
+        eprintln!("drop box: {message}");
+    }
 }
 
 /// Dragging over the area and showing an outcome make it clearly visible.
@@ -319,21 +368,22 @@ fn target_opacity(visible: bool, opacity: f64, emphasized: bool) -> f64 {
 
 const FADE_STEPS: u32 = 6;
 
-fn fade_to(app: &AppHandle, window: &WebviewWindow, target: f64) {
+fn fade_to(app: &AppHandle, window: &WebviewWindow, target: f64, steps: u32) {
     let state = app.state::<DropboxState>();
     let start = *state.shown_opacity.lock().unwrap();
     if (start - target).abs() < 0.001 {
         return;
     }
+    debug_drop(format_args!("opacity {start:.2} -> {target:.2} in {steps} steps"));
     let generation = state.fade.fetch_add(1, Ordering::SeqCst) + 1;
     let (app, window) = (app.clone(), window.clone());
     std::thread::spawn(move || {
         let state = app.state::<DropboxState>();
-        for step in 1..=FADE_STEPS {
+        for step in 1..=steps {
             if state.fade.load(Ordering::SeqCst) != generation {
                 return;
             }
-            let value = start + (target - start) * step as f64 / FADE_STEPS as f64;
+            let value = start + (target - start) * step as f64 / steps as f64;
             let shown = window.clone();
             let _ = app.run_on_main_thread(move || {
                 if let Ok(gtk_window) = shown.gtk_window() {
@@ -459,19 +509,38 @@ fn connect_native<W: gtk::prelude::IsA<gtk::Widget> + 'static>(app: &AppHandle, 
     let entries: Vec<_> = NativeDrop::targets().into_iter().map(|target| gtk::TargetEntry::new(target, gtk::TargetFlags::OTHER_APP, 0)).collect();
     webview.drag_dest_set_target_list(Some(&gtk::TargetList::new(&entries)));
 
-    let motion_hover = hover.clone();
-    webview.connect_drag_motion(move |_, context, _, _, time| {
+    // A leave that a motion follows within a moment is not the drag leaving; ending and starting the
+    // emphasis for it would change the window over and over under the pointer.
+    let leaving = Rc::new(Cell::new(0u32));
+    let (motion_hover, motion_leaving) = (hover.clone(), leaving.clone());
+    let last_point = Rc::new(Cell::new((i32::MIN, i32::MIN)));
+    webview.connect_drag_motion(move |_, context, x, y, time| {
         context.drag_status(DragAction::COPY, time);
+        motion_leaving.set(motion_leaving.get().wrapping_add(1));
+        let (last_x, last_y) = last_point.get();
+        if (x - last_x).abs() + (y - last_y).abs() > 24 {
+            last_point.set((x, y));
+            debug_drop(format_args!("motion at {x},{y}"));
+        }
         motion_hover(true);
         true
     });
     webview.connect_drag_leave(move |webview, _, _| {
         webview.stop_signal_emission_by_name("drag-leave");
-        hover(false);
+        debug_drop(format_args!("leave"));
+        let generation = leaving.get().wrapping_add(1);
+        leaving.set(generation);
+        let (hover, leaving) = (hover.clone(), leaving.clone());
+        gtk::glib::timeout_add_local_once(Duration::from_millis(150), move || {
+            if leaving.get() == generation {
+                hover(false);
+            }
+        });
     });
 
     let (drops, drop_app, data_app) = (session.clone(), app.clone(), app.clone());
-    webview.connect_drag_drop(move |webview, context, _, _, time| {
+    webview.connect_drag_drop(move |webview, context, x, y, time| {
+        debug_drop(format_args!("drop at {x},{y}"));
         let offered = context.list_targets().into_iter().map(|atom| atom.name().to_string()).collect();
         let mut drop = NativeDrop::new(offered);
         match drop.next_target() {
@@ -719,38 +788,193 @@ fn target(app: &AppHandle) -> Result<Store, String> {
 }
 
 fn process(app: &AppHandle, items: Vec<Item>) {
+    super::hidden::touch();
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<DropboxState>();
         state.busy.fetch_add(1, Ordering::SeqCst);
         show_state(&app);
-        let (mut results, store_name) = match target(&app) {
+        let (results, store_name) = match target(&app) {
             Ok(store) => {
-                let mut results = Vec::new();
-                for item in items {
-                    save_item(&store, item, &mut results);
-                }
-                for result in &results {
-                    if let Ok(Outcome::Saved(Some(image))) = result {
-                        let _ = app.emit_to("main", "store-added", serde_json::json!({ "storeId": store.id, "image": image }));
-                    }
-                }
-                (results, store.name)
+                let album = settings(&app).albums.get(&store.id).cloned().unwrap_or_default();
+                (save_into(&app, &store, &album, items), store.name)
             }
             Err(error) => (vec![Err(error)], String::new()),
         };
-        if results.is_empty() {
-            results.push(Err("Nothing to save: no picture, file or link came with it.".into()));
-        }
         send_report(&app, summarize(&results, &store_name));
         state.busy.fetch_sub(1, Ordering::SeqCst);
         show_state(&app);
     });
 }
 
+/// Saves a drop into a store, and into one of its albums when one is given, and tells the gallery:
+/// `store-added` for each new picture and `album-added` for everything the album gained, including
+/// pictures the store already had.
+fn save_into<R: tauri::Runtime>(app: &AppHandle<R>, store: &Store, album: &str, items: Vec<Item>) -> Vec<Result<Outcome, String>> {
+    let mut results = Vec::new();
+    for item in items {
+        save_item(store, item, &mut results);
+    }
+    let joined = match add_to_album(store, album, &results) {
+        Ok(()) => !album.is_empty(),
+        Err(error) => {
+            results.push(Err(format!("Saved, but not added to the album: {error}")));
+            false
+        }
+    };
+    let mut album_paths = Vec::new();
+    for result in &results {
+        match result {
+            Ok(Outcome::Saved(image, placed)) => {
+                if let Some(image) = image {
+                    let _ = app.emit_to("main", "store-added", serde_json::json!({ "storeId": store.id, "image": image }));
+                }
+                if joined {
+                    album_paths.extend(placed_path(store, placed, image.as_ref().map(|image| image.path.clone())));
+                }
+            }
+            Ok(Outcome::Duplicate(placed)) if joined => album_paths.extend(placed_path(store, placed, None)),
+            _ => {}
+        }
+    }
+    if joined && !album_paths.is_empty() {
+        let _ = app.emit_to("main", "album-added", serde_json::json!({ "storeId": store.id, "albumId": album, "paths": album_paths }));
+    }
+    if results.is_empty() {
+        results.push(Err("Nothing to save: no picture, file or link came with it.".into()));
+    }
+    results
+}
+
+/// Where a saved picture is in the store folder, looking an Immich asset up when needed.
+fn placed_path(store: &Store, placed: &Placed, known: Option<String>) -> Option<String> {
+    known.or_else(|| match placed {
+        Placed::File(path) => Some(super::path_string(path)),
+        Placed::Asset(id) => immich::local_path(store, id).map(|path| super::path_string(&path)),
+    })
+}
+
+/// Drops on the main window wait here while the page works out whether they landed on an album.
+#[derive(Default)]
+pub struct WindowDrops {
+    next: AtomicUsize,
+    pending: Mutex<std::collections::HashMap<usize, Vec<Item>>>,
+}
+
+/// Reads pictures dragged onto the main window from other programs. Drags inside the page (pictures
+/// onto albums, albums into albums, sections into place) are left to WebKit.
+pub fn connect_window<W: gtk::prelude::IsA<gtk::Widget> + 'static>(app: &AppHandle, webview: &W) {
+    use gtk::{gdk::{Atom, DragAction}, prelude::*};
+    // WebKit's own targets stay, so drags inside the page keep working; the picture targets join them.
+    let list = webview.drag_dest_get_target_list().unwrap_or_else(|| gtk::TargetList::new(&[]));
+    for target in NativeDrop::targets() {
+        list.add(&Atom::intern(target), gtk::TargetFlags::OTHER_APP.bits(), 0);
+    }
+    webview.drag_dest_set_target_list(Some(&list));
+    let external = |context: &gtk::gdk::DragContext| context.drag_get_source_widget().is_none();
+
+    let motion_app = app.clone();
+    webview.connect_drag_motion(move |_, context, x, y, time| {
+        if !external(context) {
+            return false;
+        }
+        context.drag_status(DragAction::COPY, time);
+        let _ = motion_app.emit_to("main", "window-drag", serde_json::json!({ "x": x, "y": y }));
+        true
+    });
+    let leave_app = app.clone();
+    webview.connect_drag_leave(move |_, context, _| {
+        if external(context) {
+            let _ = leave_app.emit_to("main", "window-drag", serde_json::json!({ "left": true }));
+        }
+    });
+
+    let session: Rc<RefCell<Option<(NativeDrop, i32, i32)>>> = Rc::default();
+    let (drops, drop_app, data_app) = (session.clone(), app.clone(), app.clone());
+    webview.connect_drag_drop(move |webview, context, x, y, time| {
+        if !external(context) {
+            return false;
+        }
+        let offered = context.list_targets().into_iter().map(|atom| atom.name().to_string()).collect();
+        let mut drop = NativeDrop::new(offered);
+        match drop.next_target() {
+            Some(target) => {
+                *drops.borrow_mut() = Some((drop, x, y));
+                webview.drag_get_data(context, &Atom::intern(&target), time);
+            }
+            None => {
+                context.drag_finish(false, false, time);
+                let _ = drop_app.emit_to("main", "window-drop", serde_json::json!({ "message": nothing_offered(&drop.offered).message }));
+            }
+        }
+        true
+    });
+    webview.connect_drag_data_received(move |webview, context, _, _, data, _, time| {
+        let Some((mut drop, x, y)) = session.borrow_mut().take() else { return };
+        webview.stop_signal_emission_by_name("drag-data-received");
+        let items = selection_items(&data.target().name(), &data.data());
+        match drop.accept(items) {
+            Next::Request(target) => {
+                *session.borrow_mut() = Some((drop, x, y));
+                webview.drag_get_data(context, &Atom::intern(&target), time);
+            }
+            Next::Done(items) => {
+                context.drag_finish(true, false, time);
+                let drops = data_app.state::<WindowDrops>();
+                let token = drops.next.fetch_add(1, Ordering::SeqCst) + 1;
+                drops.pending.lock().unwrap().insert(token, items);
+                let _ = data_app.emit_to("main", "window-drop", serde_json::json!({ "token": token, "x": x, "y": y }));
+            }
+            Next::Nothing => {
+                context.drag_finish(false, false, time);
+                let _ = data_app.emit_to("main", "window-drop", serde_json::json!({ "message": nothing_offered(&drop.offered).message }));
+            }
+        }
+    });
+}
+
+/// Saves a drop on the main window into the store, and the album, the page found under it.
+#[tauri::command]
+pub async fn window_drop(app: AppHandle, token: usize, store_id: String, album_id: String) -> Result<String, String> {
+    let items = app.state::<WindowDrops>().pending.lock().unwrap().remove(&token).ok_or("This drop was already handled.")?;
+    super::hidden::touch();
+    let store = stores::find_store(&store_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let results = save_into(&app, &store, &album_id, items);
+        summarize(&results, &store.name).message
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn window_drop_cancel(app: AppHandle, token: usize) {
+    app.state::<WindowDrops>().pending.lock().unwrap().remove(&token);
+}
+
+/// Adds what was saved, and what the store already had, to the album chosen for this store.
+fn add_to_album(store: &Store, album: &str, results: &[Result<Outcome, String>]) -> Result<(), String> {
+    if album.is_empty() {
+        return Ok(());
+    }
+    let placed = results.iter().filter_map(|result| match result {
+        Ok(Outcome::Saved(_, placed) | Outcome::Duplicate(placed)) => Some(placed),
+        Err(_) => None,
+    });
+    if store.immich {
+        let assets: Vec<String> = placed.filter_map(|placed| match placed { Placed::Asset(id) => Some(id.clone()), Placed::File(_) => None }).collect();
+        return immich::add_to_album(store, album, &assets);
+    }
+    let paths: Vec<String> = placed.filter_map(|placed| match placed { Placed::File(path) => Some(super::path_string(path)), Placed::Asset(_) => None }).collect();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    super::albums::album_add(album.to_string(), paths).map(|_| ())
+}
+
 fn summarize(results: &[Result<Outcome, String>], store: &str) -> DropReport {
-    let saved = results.iter().filter(|result| matches!(result, Ok(Outcome::Saved(_)))).count();
-    let duplicates = results.iter().filter(|result| matches!(result, Ok(Outcome::Duplicate))).count();
+    let saved = results.iter().filter(|result| matches!(result, Ok(Outcome::Saved(..)))).count();
+    let duplicates = results.iter().filter(|result| matches!(result, Ok(Outcome::Duplicate(_)))).count();
     let failure = results.iter().find_map(|result| result.as_ref().err());
     let mut parts = Vec::new();
     match saved {
@@ -884,8 +1108,8 @@ fn store_file(store: &Store, staged: Staged) -> Result<Outcome, String> {
         return upload_to_immich(store, &staged, &sha1, &name);
     }
     let folder = Path::new(&store.path).join(&sha1[..2]).join(&sha1[2..4]);
-    if contains_hash(&folder, &sha1) {
-        return Ok(Outcome::Duplicate);
+    if let Some(existing) = with_hash(&folder, &sha1) {
+        return Ok(Outcome::Duplicate(Placed::File(existing)));
     }
     let destination = folder.join(&name);
     let failed = |error: &dyn Display| format!("Cannot save {}: {error}", destination.display());
@@ -902,22 +1126,25 @@ fn store_file(store: &Store, staged: Staged) -> Result<Outcome, String> {
     fs::set_permissions(&temp, fs::Permissions::from_mode(0o644)).map_err(|error| failed(&error))?;
     match temp.persist_noclobber(&destination) {
         Ok(()) => {}
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => return Ok(Outcome::Duplicate),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => return Ok(Outcome::Duplicate(Placed::File(destination))),
         // Network shares may not support renaming without overwriting; the hash was checked above.
         Err(error) => error.path.persist(&destination).map_err(|error| failed(&error.error))?,
     }
     stores::record_picture(&destination);
-    Ok(Outcome::Saved(super::image_entry(&destination)))
+    Ok(Outcome::Saved(super::image_entry(&destination), Placed::File(destination)))
 }
 
 fn upload_to_immich(store: &Store, staged: &Staged, sha1: &str, name: &str) -> Result<Outcome, String> {
     let data = fs::read(&staged.path).map_err(|error| format!("Cannot read {}: {error}", staged.path.display()))?;
-    Ok(match immich::upload(&data, name, sha1, staged.modified)? {
-        immich::Upload::Duplicate => Outcome::Duplicate,
-        immich::Upload::Created(id) => Outcome::Saved(immich::local_path(store, &id).and_then(|path| {
-            stores::record_picture(&path);
-            super::image_entry(&path)
-        })),
+    Ok(match immich::upload(store, &data, name, sha1, staged.modified)? {
+        immich::Upload::Duplicate(id) => Outcome::Duplicate(Placed::Asset(id)),
+        immich::Upload::Created(id) => Outcome::Saved(
+            immich::local_path(store, &id).and_then(|path| {
+                stores::record_picture(&path);
+                super::image_entry(&path)
+            }),
+            Placed::Asset(id),
+        ),
     })
 }
 
@@ -936,10 +1163,13 @@ fn sha1_file(path: &Path) -> Result<String, String> {
 }
 
 /// Whether a file named after this hash, with any extension, is in the folder.
-fn contains_hash(folder: &Path, sha1: &str) -> bool {
+/// The file already in the store under this hash, whatever its extension.
+fn with_hash(folder: &Path, sha1: &str) -> Option<PathBuf> {
     fs::read_dir(folder)
-        .map(|entries| entries.flatten().any(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase().split('.').next() == Some(sha1)))
-        .unwrap_or(false)
+        .ok()?
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase().split('.').next() == Some(sha1))
+        .map(|entry| entry.path())
 }
 
 fn read_head(path: &Path) -> Vec<u8> {
@@ -1113,7 +1343,7 @@ mod tests {
     use super::*;
 
     fn folder_store(root: &Path) -> Store {
-        Store { id: "test".into(), name: "Test".into(), path: super::super::path_string(root), immich: false, immich_path: String::new() }
+        Store { id: "test".into(), name: "Test".into(), path: super::super::path_string(root), immich: false, ..Default::default() }
     }
 
     #[test]
@@ -1128,28 +1358,74 @@ mod tests {
     }
 
     #[test]
+    fn dropped_pictures_join_the_stores_album_even_when_already_there() {
+        let root = tempfile::tempdir().unwrap();
+        let store = stores::create("Drops".into(), super::super::path_string(root.path())).unwrap();
+        let album = super::super::albums::album_create(store.id.clone(), "From the drop box".into(), String::new()).unwrap();
+        let source = root.path().join("new.png");
+        fs::write(&source, b"dropped picture").unwrap();
+        let results = vec![save_local_file(&store, &source), save_local_file(&store, &source)];
+        assert!(matches!(results[1], Ok(Outcome::Duplicate(_))), "the second drop finds the first");
+        add_to_album(&store, &album.id, &results).unwrap();
+        let pictures = super::super::albums::album_pictures(album.id.clone()).unwrap();
+        assert_eq!(pictures.len(), 1, "both drops are the same picture: {pictures:?}");
+        // Without an album nothing is added, and an album that is gone says so.
+        add_to_album(&store, "", &results).unwrap();
+        assert!(add_to_album(&store, "gone", &results).is_err());
+        super::super::albums::album_delete(album.id).unwrap();
+    }
+
+    #[test]
     fn files_are_stored_by_hash_once() {
         let root = tempfile::tempdir().unwrap();
         let store = folder_store(root.path());
         let source = root.path().join("source.JPG");
         fs::write(&source, b"picture bytes").unwrap();
         let sha1 = sha1_smol::Sha1::from(b"picture bytes").digest().to_string();
-        assert!(matches!(save_local_file(&store, &source), Ok(Outcome::Saved(_))));
+        assert!(matches!(save_local_file(&store, &source), Ok(Outcome::Saved(..))));
         let saved = root.path().join(&sha1[..2]).join(&sha1[2..4]).join(format!("{sha1}.jpg"));
         assert_eq!(fs::read(&saved).unwrap(), b"picture bytes");
         assert_eq!(fs::metadata(&saved).unwrap().permissions().mode() & 0o777, 0o644);
         // Same content under another name or extension, or as bytes, is a duplicate.
         let copy = root.path().join("copy.png");
         fs::copy(&source, &copy).unwrap();
-        assert!(matches!(save_local_file(&store, &copy), Ok(Outcome::Duplicate)));
+        assert!(matches!(save_local_file(&store, &copy), Ok(Outcome::Duplicate(Placed::File(_)))));
         let staged = stage_bytes(&store, b"picture bytes", "drop.webp", "image/webp").unwrap();
-        assert!(matches!(store_file(&store, staged), Ok(Outcome::Duplicate)));
+        assert!(matches!(store_file(&store, staged), Ok(Outcome::Duplicate(_))));
         let staged = stage_bytes(&store, b"other bytes", "notes.txt", "text/plain").unwrap();
         assert!(matches!(store_file(&store, staged), Err(message) if message.contains(".txt")));
         let staged = stage_bytes(&store, b"other bytes", "photo.heic", "").unwrap();
-        assert!(matches!(store_file(&store, staged), Ok(Outcome::Saved(None))));
+        assert!(matches!(store_file(&store, staged), Ok(Outcome::Saved(None, _))));
         let leftovers = fs::read_dir(root.path()).unwrap().flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with(".inpaint-drop-")).count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn a_drop_into_an_album_tells_the_gallery_what_the_album_gained() {
+        use tauri::Listener;
+        let app = tauri::test::mock_app();
+        let heard: std::sync::Arc<Mutex<Vec<(String, String)>>> = Default::default();
+        for name in ["store-added", "album-added"] {
+            let heard = heard.clone();
+            app.listen_any(name, move |event| heard.lock().unwrap().push((name.to_string(), event.payload().to_string())));
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = stores::create("Uploads".into(), super::super::path_string(root.path())).unwrap();
+        let album = super::super::albums::album_create(store.id.clone(), "Default".into(), String::new()).unwrap();
+        let png = super::super::encode_image(&image::DynamicImage::new_rgb8(3, 2), image::ImageFormat::Png).unwrap();
+        let file = root.path().join("dropped.png");
+        fs::write(&file, &png).unwrap();
+        let results = save_into(app.handle(), &store, &album.id, vec![Item::File(file.clone()), Item::File(file)]);
+        assert!(matches!(results[0], Ok(Outcome::Saved(Some(_), _))) && matches!(results[1], Ok(Outcome::Duplicate(_))));
+        let heard = heard.lock().unwrap().clone();
+        let names: Vec<&str> = heard.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["store-added", "album-added"], "{heard:?}");
+        let added: serde_json::Value = serde_json::from_str(&heard[1].1).unwrap();
+        assert_eq!(added["albumId"], album.id.as_str());
+        let saved: serde_json::Value = serde_json::from_str(&heard[0].1).unwrap();
+        assert_eq!(added["paths"][0], saved["image"]["path"], "the album names the picture the gallery was given");
+        assert_eq!(super::super::albums::album_pictures(album.id.clone()).unwrap().len(), 1);
+        super::super::albums::album_delete(album.id).unwrap();
     }
 
     #[test]
@@ -1159,7 +1435,7 @@ mod tests {
         let png = image::DynamicImage::new_rgb8(2, 2);
         let bytes = super::super::encode_image(&png, image::ImageFormat::Png).unwrap();
         let staged = stage_bytes(&store, &bytes, "", "").unwrap();
-        let Ok(Outcome::Saved(Some(entry))) = store_file(&store, staged) else { panic!("expected a picture entry") };
+        let Ok(Outcome::Saved(Some(entry), _)) = store_file(&store, staged) else { panic!("expected a picture entry") };
         assert_eq!(entry.extension, "png");
         assert!(entry.name.len() == 44 && entry.path.starts_with(&store.path));
     }

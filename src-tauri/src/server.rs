@@ -322,6 +322,7 @@ pub fn server_bridge(state: tauri::State<'_, ServerState>, ready: bool) {
 
 #[tauri::command]
 pub fn server_take_job(state: tauri::State<'_, ServerState>, id: u64) -> Option<Value> {
+    super::hidden::touch();
     state.0.jobs.lock().unwrap().get_mut(&id).and_then(|job| job.input.take())
 }
 
@@ -680,7 +681,8 @@ fn allowed_path(settings: &ServerSettings, raw: &str, existing: bool) -> Result<
         .iter()
         .filter_map(|folder| fs::canonicalize(folder).ok())
         .any(|folder| resolved.starts_with(folder));
-    if !allowed {
+    let concealed = !super::hidden::revealed() && super::stores::all_stores().iter().any(|store| store.hidden && resolved.starts_with(&store.path));
+    if !allowed || concealed {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             format!("{} is outside the folders the API may read and write. Add its folder in Inpaint's API server settings.", resolved.display()),

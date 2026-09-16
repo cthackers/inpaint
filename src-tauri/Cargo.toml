@@ -41,8 +41,13 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 # Web requests (downloads and Immich) in the app, trusting the system's certificates.
 ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+kamadak-exif = "0.6"
+argon2 = "0.5"
 
 # Thumbnail decoding remains responsive when ImageMagick is unavailable while
 # running `tauri dev`, whose dependencies would otherwise be unoptimized.
 [profile.dev.package."*"]
 opt-level = 2
+
+[dev-dependencies]
+tauri = { version = "2", features = ["protocol-asset", "test"] }

@@ -12,7 +12,22 @@ WEAK_FILENAME = "realesr-general-wdn-x4v3.pth"
 WEAK_URL = f"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/{WEAK_FILENAME}"
 
 
-def checkpoint(path: Path, *, url=None, drive_id=None):
+# Upscalers that keep a photo's own texture, chosen by measurement: on shrunk photos the Real-ESRGAN and
+# Real-HAT GAN models kept 43-52% of the original fine detail (the smooth, plastic look), these 66-92%.
+# name: (file, download address, SHA-256). Both by Philip Hofmann (Phhofm/models), CC-BY-4.0.
+PHOTO_MODELS = {
+    # Trained on web-like degradations: keeps texture without sharpening JPEG artifacts into it.
+    "realwebphoto-dat2": ("4xRealWebPhoto_v4_dat2.pth",
+                          "https://github.com/Phhofm/models/releases/download/4xRealWebPhoto_v4_dat2/4xRealWebPhoto_v4_dat2.pth",
+                          "9b82f8f60826e59b9d2e56a6e6ad9a842b84d57a9ec5ed7377bf120032b2c4c9"),
+    # Trained on clean photos: the most detail, but it also sharpens compression artifacts.
+    "nomos2-hq-atd": ("4xNomos2_hq_atd.pth",
+                      "https://github.com/Phhofm/models/releases/download/4xNomos2_hq_atd/4xNomos2_hq_atd.pth",
+                      "06e007a70af59c4e3acfbfbd5dca4ed20dfaeadd9857ffca63c8c807a8c40283"),
+}
+
+
+def checkpoint(path: Path, *, url=None, drive_id=None, sha256=None):
     if path.is_file():
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -24,7 +39,7 @@ def checkpoint(path: Path, *, url=None, drive_id=None):
                 raise RuntimeError(f"Could not download {path.name}.")
         else:
             import torch
-            torch.hub.download_url_to_file(url, str(temporary))
+            torch.hub.download_url_to_file(url, str(temporary), hash_prefix=sha256)
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -51,20 +66,25 @@ class LanczosUpscaler:
         source.resize(output_size(source.size, scale), Image.Resampling.LANCZOS).save(output_path, format="PNG")
 
 
-class HatUpscaler:
-    def __init__(self, models_dir):
+class SpandrelUpscaler:
+    """A 4× network spandrel loads, run in overlapping tiles and resized to the asked scale."""
+
+    def __init__(self, path, name):
         import torch
         from spandrel import ImageModelDescriptor, ModelLoader
 
-        path = checkpoint(Path(models_dir) / HAT_FILENAME, drive_id=HAT_DRIVE_ID)
+        self.name = name
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ModelLoader().load_from_file(path)
         if not isinstance(self.model, ImageModelDescriptor) or self.model.scale != 4:
-            raise RuntimeError("Expected a 4× HAT image upscaling checkpoint.")
-        # FP32 avoids half-precision overflows in HAT's attention layers.
+            raise RuntimeError(f"Expected a 4× {name} image upscaling checkpoint.")
+        # FP32 avoids half-precision overflows in the attention layers these networks share.
         self.model.to(self.device).float().eval()
-        self.tile_size = 128
-        self.tile_pad = 32
+        # Larger tiles run about 30% faster (measured on DAT2 and ATD, 256 px: 1.6-2.3 GB), where the GPU
+        # has the room; smaller cards keep 128 px tiles, under 1 GB.
+        roomy = self.device.type == "cuda" and torch.cuda.mem_get_info()[0] > 6 * 2**30
+        self.tile_size = 256 if roomy else 128
+        self.tile_pad = 24 if roomy else 32
 
     def upscale(self, input_path, output_path, scale):
         import numpy as np
@@ -87,7 +107,7 @@ class HatUpscaler:
                     tensor = torch.from_numpy(tile.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
                     prediction = self.model(tensor)
                     if not torch.isfinite(prediction).all():
-                        raise RuntimeError("HAT produced invalid pixels; the image was not changed.")
+                        raise RuntimeError(f"{self.name} produced invalid pixels; the image was not changed.")
                     pixels = prediction.squeeze(0).clamp(0, 1).mul(255).round().to(device="cpu", dtype=torch.uint8)
                     rendered = Image.fromarray(pixels.numpy().transpose(1, 2, 0))
                     # Discard the contextual border and keep every output pixel once.
@@ -99,6 +119,17 @@ class HatUpscaler:
         if "A" in source.getbands():
             result.putalpha(source.getchannel("A").resize(size, Image.Resampling.LANCZOS))
         result.save(output_path, format="PNG", optimize=True)
+
+
+def HatUpscaler(models_dir):
+    return SpandrelUpscaler(checkpoint(Path(models_dir) / HAT_FILENAME, drive_id=HAT_DRIVE_ID), "HAT")
+
+
+def PhotoUpscaler(models_dir, option):
+    if option not in PHOTO_MODELS:
+        raise ValueError(f"unsupported upscaler: {option}")
+    file, url, sha256 = PHOTO_MODELS[option]
+    return SpandrelUpscaler(checkpoint(Path(models_dir) / file, url=url, sha256=sha256), file.removesuffix(".pth"))
 
 
 class GeneralUpscaler:

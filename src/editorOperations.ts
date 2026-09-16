@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type Plugin = "restore" | "gfpgan" | "realesrgan" | "remove_bg" | "hat" | "lanczos";
+export type Plugin = "restore" | "gfpgan" | "realesrgan" | "remove_bg" | "hat" | "lanczos" | "photo";
 export const RESTORE_MODES = ["compressed", "natural", "jpeg", "noise", "motion"] as const;
 // Restore detail replaced Restormer's blur and noise models; history and saved workflows may still name them.
 export const RESTORMER_MODES: Record<string, string> = { defocus: "compressed", denoise: "noise", motion: "motion" };
@@ -15,8 +15,23 @@ export type Operation =
   | { kind: "outpaint"; label: string; left: number; right: number; top: number; bottom: number; model: string; prompt: string }
   | { kind: "transform"; label: string; direction: "flip-horizontal" | "flip-vertical" | "rotate-left" | "rotate-right" }
   | { kind: "crop"; label: string; rect: Rect; angle: number }
+  | { kind: "resize"; label: string; longest: number; filter: ResizeFilter }
+  // Brush edits, kept so history can run them again on the other frames of an animation.
+  | { kind: "inpaint"; label: string; mask: string; model: string; prompt: string }
+  // Finds watermarks with Florence-2 (backend/watermark.py) and fills them with an inpainting model.
+  | { kind: "watermark"; label: string; prompts: string[]; maxPercent: number; model: string; prompt?: string }
+  | { kind: "retouch"; label: string; mode: string; source: unknown; points: number[][]; size: number; hardness: number; opacity: number }
   | { kind: "background"; label: string; mode: "color" | "image" | "blur"; color: string; path: string; blur: number; removeFirst: boolean; model: string };
 export type FaceBox = { id: number; box: Rect };
+/** Plain resampling for making a picture smaller, run by `downscale` in backend/editing.py. */
+export const RESIZE_FILTERS = [
+  { id: "lanczos", name: "Lanczos", description: "The sharpest. Fine detail and text stay crisp." },
+  { id: "bicubic", name: "Bicubic", description: "Slightly softer than Lanczos, with fewer halos on hard edges." },
+  { id: "box", name: "Area average", description: "Averages every pixel it covers. The cleanest for large reductions, with no ringing." },
+  { id: "hamming", name: "Hamming", description: "Between bilinear and bicubic, with less aliasing than bilinear." },
+  { id: "bilinear", name: "Bilinear", description: "Soft and fast." },
+] as const;
+export type ResizeFilter = (typeof RESIZE_FILTERS)[number]["id"];
 export type ActionResult = { imageData: string; rawData: string; faces: FaceBox[]; models: string[]; plugins: string[]; memory: { ram?: number; vram?: number; reserved?: number }; path: string; width: number; height: number; bytes: number };
 export type ExportSettings = { directory: string; format: "png" | "jpeg" | "webp"; quality: number; width: number; height: number; suffix: string; matte: string };
 export const imageAction = (command: string, imageData?: string, options: object = {}, referenceData?: string) =>
@@ -59,6 +74,15 @@ export async function blendImages(raw: string, restored: string, strength: numbe
 
 export async function executeOperation(data: string, operation: Operation, reference: string): Promise<string> {
   if (operation.kind === "adjust") return adjustImage(data, operation.values);
+  if (operation.kind === "watermark") {
+    const { prompts, maxPercent, model, prompt } = operation;
+    return (await imageAction("watermark", data, { mode: "remove", prompts, maxPercent, model, prompt: prompt ?? "" })).imageData;
+  }
+  if (operation.kind === "inpaint") return invoke<string>("run_inpaint", { imageData: data, maskData: operation.mask, model: operation.model, prompt: operation.prompt });
+  if (operation.kind === "retouch") {
+    const { mode, source, points, size, hardness, opacity } = operation;
+    return (await imageAction("retouch", data, { mode, source, points, size, hardness, opacity })).imageData;
+  }
   if (operation.kind === "outpaint" || operation.kind === "refine_edges") return (await imageAction(operation.kind, data, operation)).imageData;
   if (operation.kind === "face") {
     return (await imageAction("face_preview", data, operation)).imageData;
@@ -114,3 +138,8 @@ export async function adjustImage(data: string, values: Adjustments, maxSize?: n
   context.putImageData(pixels, 0, 0);
   return element.toDataURL("image/png");
 }
+
+/** What watermark detection looks for unless told otherwise; each phrase finds one mark. */
+export const WATERMARK_PROMPTS = ["watermark", "watermark text", "translucent text overlay"];
+/** Phrases written as one line, separated by commas. */
+export const watermarkPrompts = (text: string) => [...new Set(text.split(",").map((part) => part.trim()).filter(Boolean))].slice(0, 8);

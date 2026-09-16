@@ -7,12 +7,19 @@ import type { HistoryEntry } from "./useEditHistory";
 import { usePreference } from "./preferences";
 import ToolSection from "./ToolSection";
 import { storage } from "./storage";
+import Select from "./Select";
 
 export type WorkspaceTab = "history" | "workflows" | "batch" | "export" | "memory";
+/** A big action asked for by a shortcut; `count` rises each time, so the same action can be asked again. */
+export type WorkspaceCommand = { name: "run-workflow" | "export" | "run-batch"; count: number };
+
+// The last command carried out. The panel is built again whenever its tab opens, so the count it was
+// last built with would otherwise run the same action again.
+let commandsDone = 0;
 type Workflow = { id: string; name: string; steps: Operation[] };
 type BatchItem = { path: string; status: string; output?: string };
 type Props = {
-  tab: WorkspaceTab; onTab: (tab: WorkspaceTab) => void; onClose: () => void;
+  tab: WorkspaceTab; onClose: () => void; command?: WorkspaceCommand;
   data: string; name: string; dimensions: { width: number; height: number };
   history: HistoryEntry[]; position: number; onJump: (index: number) => void;
   suggestions: Operation[]; busy: boolean; onBusy: (value: boolean) => void;
@@ -27,7 +34,7 @@ function readSaved<T>(key: string, fallback: T): T {
 const defaultExport: ExportSettings = { directory: "", format: "png", quality: 95, width: 0, height: 0, suffix: "_edited", matte: "#ffffff" };
 const tabIcons = { history: History, workflows: Layers, batch: Images, export: Download, memory: Cpu };
 const operationKey = (operation: Operation) => operation.kind === "plugin"
-  ? (["hat", "lanczos", "realesrgan"].includes(operation.plugin) ? "upscale" : operation.plugin)
+  ? (["hat", "lanczos", "realesrgan", "photo"].includes(operation.plugin) ? "upscale" : operation.plugin)
   : operation.kind === "transform" ? operation.direction : operation.kind;
 const fileName = (path: string) => path.split(/[\\/]/).at(-1) ?? path;
 const memorySize = (bytes?: number) => bytes === undefined ? "Unavailable" : `${(bytes / 1024 ** 2).toFixed(0)} MB`;
@@ -137,25 +144,49 @@ export default function Workspace(props: Props) {
       onMessage(`Batch ${cancelled.current ? "stopped" : "finished"}: ${completed} exported, ${failed} failed.`);
     } finally { setBatchRunning(false); props.onBusy(false); }
   };
-  const workflowPicker = <label>Saved workflow<select value={workflow?.id ?? ""} disabled={busy} onChange={(event) => setSelected(event.target.value)}>
+  const workflowPicker = <label>Saved workflow<Select value={workflow?.id ?? ""} disabled={busy} onChange={(event) => setSelected(event.target.value)}>
     <option value="">Choose a workflow…</option>{workflows.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-  </select></label>;
+  </Select></label>;
   const exportControls = <ToolSection id="export-settings" title="Export settings" icon={SlidersHorizontal}><div className="workspace-form">
     <button disabled={busy} onClick={() => void chooseDirectory()}><FolderOpen size={14} /> Choose export folder</button>
     <small className="path-text" title={settings.directory}>{settings.directory || "No folder selected"}</small>
-    <div className="form-row"><label>Format<select value={settings.format} disabled={busy} onChange={(e) => setSettings({ ...settings, format: e.target.value as ExportSettings["format"] })}><option value="png">PNG · Lossless</option><option value="jpeg">JPEG</option><option value="webp">WebP</option></select></label>
+    <div className="form-row"><label>Format<Select value={settings.format} disabled={busy} onChange={(e) => setSettings({ ...settings, format: e.target.value as ExportSettings["format"] })}><option value="png">PNG · Lossless</option><option value="jpeg">JPEG</option><option value="webp">WebP</option></Select></label>
       <label>Quality {settings.quality}%<input aria-label="Export quality" type="range" min="1" max="100" value={settings.quality} disabled={busy || settings.format === "png"} onChange={(e) => setSettings({ ...settings, quality: +e.target.value })} /></label></div>
     <label>Filename suffix<input value={settings.suffix} maxLength={100} disabled={busy} onChange={(e) => setSettings({ ...settings, suffix: e.target.value })} /></label>
     <label className="check-label"><input type="checkbox" checked={keepRatio} disabled={busy} onChange={(e) => { setKeepRatio(e.target.checked); if (e.target.checked) setSettings({ ...settings, height: 0 }); }} /> Keep aspect ratio</label>
-    <div className="form-row"><label>Width (0 = automatic)<input type="number" min="0" max="32768" value={settings.width} disabled={busy} onChange={(e) => updateDimension("width", +e.target.value)} /></label>
-      <label>Height (0 = automatic)<input type="number" min="0" max="32768" value={settings.height} disabled={busy} onChange={(e) => updateDimension("height", +e.target.value)} /></label></div>
+    <div className="form-row"><label>Width (0 = auto)<input type="number" min="0" max="32768" value={settings.width} disabled={busy} onChange={(e) => updateDimension("width", +e.target.value)} /></label>
+      <label>Height (0 = auto)<input type="number" min="0" max="32768" value={settings.height} disabled={busy} onChange={(e) => updateDimension("height", +e.target.value)} /></label></div>
     {settings.format === "jpeg" && <label>Transparency fill<input type="color" value={settings.matte} disabled={busy} onChange={(e) => setSettings({ ...settings, matte: e.target.value })} /></label>}
     <small>Zero in both dimensions keeps the edited size. Existing files are never overwritten; duplicate names receive a number.</small>
   </div></ToolSection>;
 
+  // A shortcut asked for one of the big actions; it runs once, with what the panel shows, or says why not.
+  useEffect(() => {
+    const command = props.command;
+    if (!command || command.count <= commandsDone) return;
+    commandsDone = command.count;
+    if (busy) { onMessage("Wait for the current action to finish."); return; }
+    if (command.name === "run-workflow") {
+      if (!workflow) onMessage("Choose a workflow first.");
+      else if (!data) onMessage("There is no picture to run it on.");
+      else void props.onRun(workflow.steps, workflow.name);
+    } else if (command.name === "export") {
+      if (!settings.directory) onMessage("Choose an export folder first.");
+      else if (!data) onMessage("There is no picture to export.");
+      else void exportCurrent();
+    } else if (command.name === "run-batch") {
+      if (!workflow) onMessage("Choose a workflow for the batch first.");
+      else if (!files.length) onMessage("Add pictures to the batch first.");
+      else if (!settings.directory) onMessage("Choose an export folder first.");
+      else void runBatch();
+    }
+  // Only a new command runs; the rest is read as it stands when it arrives.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.command?.count]);
+
   return <aside className="workspace-drawer" aria-label="Editing workspace" onPointerDown={(e) => e.stopPropagation()} onPointerMove={(e) => e.stopPropagation()} onWheel={(e) => e.stopPropagation()}>
-    <div className="workspace-heading"><strong>Workspace</strong><button aria-label="Close workspace" disabled={busy} onClick={props.onClose}><X size={17} /></button></div>
-    <nav>{(["history", "workflows", "batch", "export", "memory"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => props.onTab(item)}>{(() => { const Icon = tabIcons[item]; return <Icon size={15} aria-hidden="true" />; })()}{item}</button>)}</nav>
+    {/* The tabs live in the dock's rail beside this panel, so the heading only names the open one. */}
+    <div className="workspace-heading"><strong>{tab[0].toUpperCase() + tab.slice(1)}</strong><button aria-label="Close the panel" disabled={busy} onClick={props.onClose}><X size={17} /></button></div>
     <div className="workspace-content"><ToolSection key={tab} id={`workspace-${tab}`} title={tab[0].toUpperCase() + tab.slice(1)} icon={tabIcons[tab]}>
       {tab === "history" && <><p>Choose any step to return to it. A new edit replaces the steps after the selected one.</p><div className="history-list">{props.history.map((entry, index) => <button key={index} className={index === props.position ? "selected" : ""} disabled={busy} onClick={() => props.onJump(index)}><img src={entry.data} alt="" loading="lazy" decoding="async" /><span><strong>{index}. {entry.label}</strong>{index === props.position && <small>Current image</small>}</span></button>)}</div></>}
       {tab === "workflows" && <div className="workspace-form">
@@ -163,7 +194,7 @@ export default function Workspace(props: Props) {
         <div className="form-row"><button disabled={busy || !workflow} onClick={() => { if (workflow) { setDraft(structuredClone(workflow.steps)); setWorkflowName(workflow.name); } }}>Edit a copy</button><button disabled={busy || !workflow} onClick={() => { saveWorkflows(workflows.filter((item) => item.id !== selected)); setSelected(""); }}><Trash2 size={13} /> Delete</button></div>
         {workflow && <><ol>{workflow.steps.map((step, i) => <li key={i}>{step.label}</li>)}</ol><button className="accent" disabled={busy || !data} onClick={() => void props.onRun(workflow.steps, workflow.name)}><Play size={14} /> Run on current image</button></>}
         <hr /><strong>Build a workflow</strong><p>Add operations using the current tool settings. Face replacement uses the largest face in each image. Source photos are saved as file paths.</p>
-        <label>Operation<select disabled={busy} value={suggestion} onChange={(e) => setSelectedSuggestion(operationKey(props.suggestions[+e.target.value]))}>{props.suggestions.map((item, index) => <option key={index} value={index}>{item.label}</option>)}</select></label>
+        <label>Operation<Select disabled={busy} value={suggestion} onChange={(e) => setSelectedSuggestion(operationKey(props.suggestions[+e.target.value]))}>{props.suggestions.map((item, index) => <option key={index} value={index}>{item.label}</option>)}</Select></label>
         <button disabled={busy || draft.length >= 32 || !props.suggestions[suggestion]} onClick={() => setDraft([...draft, structuredClone(props.suggestions[suggestion])])}><Plus size={14} /> Add step</button>
         <ol className="workflow-steps">{draft.map((step, index) => <li key={index}><span>{step.label}</span><button aria-label={`Move step ${index + 1} up`} disabled={busy || index === 0} onClick={() => setDraft((old) => { const next = [...old]; [next[index - 1], next[index]] = [next[index], next[index - 1]]; return next; })}><ArrowUp size={12} /></button><button aria-label={`Move step ${index + 1} down`} disabled={busy || index === draft.length - 1} onClick={() => setDraft((old) => { const next = [...old]; [next[index + 1], next[index]] = [next[index], next[index + 1]]; return next; })}><ArrowDown size={12} /></button><button aria-label={`Remove step ${index + 1}`} disabled={busy} onClick={() => setDraft(draft.filter((_, i) => i !== index))}><X size={12} /></button></li>)}</ol>
         <label>Workflow name<input disabled={busy} maxLength={80} value={workflowName} onChange={(e) => setWorkflowName(e.target.value)} /></label>

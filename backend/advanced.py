@@ -31,7 +31,19 @@ class SmartSelection:
                 self.predictor.set_image(image)
                 self.digest = digest
             masks, scores, _ = self.predictor.predict(point_coords=np.array(coords), point_labels=np.array(labels), multimask_output=True)
-        Image.fromarray(masks[int(np.argmax(scores))].astype(np.uint8) * 255).save(output_path, "PNG")
+        import cv2
+        mask = masks[int(np.argmax(scores))].astype(np.uint8) * 255
+        # The model's outline hugs the object, leaving its edge pixels, antialiasing and contact shadow just
+        # outside; inpainting then extends those colours back into the hole. A margin of about 1% of the
+        # picture, as a brush stroke would leave, removes the object cleanly.
+        grow = select_margin(image.shape[1], image.shape[0])
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow * 2 + 1, grow * 2 + 1))
+        Image.fromarray(cv2.dilate(mask, kernel)).save(output_path, "PNG")
+
+
+def select_margin(width, height):
+    """How many pixels a smart selection grows by: about 1% of the picture's longer side."""
+    return max(4, min(48, round(max(width, height) * .012)))
 
 
 def mask_edit(input_path, output_path, options):

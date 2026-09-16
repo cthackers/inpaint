@@ -10,10 +10,14 @@ use std::{
 };
 use tempfile::Builder;
 use tauri::{Emitter, Manager};
+mod albums;
+mod animation;
 mod db;
 mod dropbox;
+mod hidden;
 mod http;
 mod immich;
+mod pictures;
 mod runtime;
 mod server;
 mod stores;
@@ -30,6 +34,7 @@ const EDITING_SCRIPT: &str = include_str!("../../backend/editing.py");
 const ADVANCED_SCRIPT: &str = include_str!("../../backend/advanced.py");
 const DOWNLOADS_SCRIPT: &str = include_str!("../../backend/downloads.py");
 const PROTOCOL_SCRIPT: &str = include_str!("../../backend/worker_protocol.py");
+const WATERMARK_SCRIPT: &str = include_str!("../../backend/watermark.py");
 
 #[derive(Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +44,10 @@ struct ImageEntry {
     extension: String,
     size: u64,
     modified_ms: u128,
+    /// When the file was created here, which for a store is when the picture was added; the
+    /// modification time where the file system keeps no creation time.
+    #[serde(default)]
+    added_ms: u128,
 }
 
 #[derive(Serialize)]
@@ -133,18 +142,13 @@ fn list_directory(path: String) -> Result<DirectoryContents, String> {
         } else if file_type.is_file() {
             let Some(extension) = picture_extension(&entry_path) else { continue };
             let metadata = entry.metadata().ok();
-            let modified_ms = metadata
-                .as_ref()
-                .and_then(|value| value.modified().ok())
-                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|value| value.as_millis())
-                .unwrap_or(0);
             images.push(ImageEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path: path_string(&entry_path),
                 extension,
-                size: metadata.map(|value| value.len()).unwrap_or(0),
-                modified_ms,
+                size: metadata.as_ref().map(|value| value.len()).unwrap_or(0),
+                modified_ms: metadata.as_ref().map_or(0, stores::modified_ms),
+                added_ms: metadata.as_ref().map_or(0, stores::added_ms),
             });
         }
     }
@@ -201,12 +205,16 @@ fn thumbnail_cache_dir() -> PathBuf {
 /// Cached thumbnails are named after the picture's path, size and modification time, so an edited
 /// picture gets a new thumbnail.
 fn thumbnail_cache_file(path: &Path, metadata: &fs::Metadata) -> PathBuf {
+    thumbnail_cache_named(path, metadata, "jpg")
+}
+
+fn thumbnail_cache_named(path: &Path, metadata: &fs::Metadata, extension: &str) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
     metadata.len().hash(&mut hasher);
     metadata.modified().ok().hash(&mut hasher);
-    thumbnail_cache_dir().join(format!("{:016x}.jpg", hasher.finish()))
+    thumbnail_cache_dir().join(format!("{:016x}.{extension}", hasher.finish()))
 }
 
 /// Notes a cached thumbnail's size and last use in cache.db, which orders the cache for pruning.
@@ -245,17 +253,19 @@ fn prune_thumbnail_cache() {
     }
 }
 
-/// A picture's thumbnail, a JPEG of at most 480×360, from the disk cache or made now.
-fn thumbnail_bytes(path: &Path) -> Result<Vec<u8>, String> {
+/// A picture's thumbnail, a JPEG of at most 480×360, from the disk cache or made now. An animated one
+/// is a GIF of the same size with every frame, which the gallery plays while the pointer is on the card.
+fn thumbnail_bytes(path: &Path, animated: bool) -> Result<Vec<u8>, String> {
     let extension = picture_extension(path).ok_or("Only PNG, JPG, WebP, GIF, BMP and TIFF images are supported")?;
+    let animated = animated && extension == "gif";
     let metadata = fs::metadata(path).map_err(|error| format!("Cannot read image: {error}"))?;
-    let cached = thumbnail_cache_file(path, &metadata);
+    let cached = if animated { thumbnail_cache_named(path, &metadata, "gif") } else { thumbnail_cache_file(path, &metadata) };
     let file_name = cached.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     if let Ok(bytes) = fs::read(&cached) {
         thumbnail_used(&file_name, bytes.len());
         return Ok(bytes);
     }
-    let thumbnail = THUMBNAIL_MAKERS.run(|| make_thumbnail(path, &extension))?;
+    let thumbnail = THUMBNAIL_MAKERS.run(|| if animated { animation::thumbnail(path) } else { make_thumbnail(path, &extension) })?;
     if fs::create_dir_all(thumbnail_cache_dir()).is_ok() && replace_file(&cached, &thumbnail).is_ok() {
         thumbnail_used(&file_name, thumbnail.len());
         prune_thumbnail_cache();
@@ -265,19 +275,31 @@ fn thumbnail_bytes(path: &Path) -> Result<Vec<u8>, String> {
 
 #[tauri::command]
 async fn read_thumbnail_data(path: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || thumbnail_bytes(Path::new(&path)).map(|bytes| format!("data:image/jpeg;base64,{}", BASE64.encode(bytes))))
+    tauri::async_runtime::spawn_blocking(move || thumbnail_bytes(Path::new(&path), false).map(|bytes| format!("data:image/jpeg;base64,{}", BASE64.encode(bytes))))
         .await
         .map_err(|error| format!("Thumbnail task failed: {error}"))?
 }
 
-/// Serves `thumb://localhost/<percent-encoded path>?v=<size>-<modified>`. The gallery loads thumbnails as
+/// Serves `thumb://localhost/<percent-encoded path>?v=<size>-<modified>`, with `&animated` for a GIF's
+/// moving thumbnail, or `&original` for the GIF itself, which the editor plays. The gallery loads thumbnails as
 /// ordinary images, which the webview decodes off its main thread and caches; the query changes the
 /// address whenever the picture changes, so a cached copy is never stale.
 fn thumbnail_response(request: &tauri::http::Request<Vec<u8>>) -> tauri::http::Response<Vec<u8>> {
     let path = percent_encoding::percent_decode_str(request.uri().path().trim_start_matches('/')).decode_utf8_lossy().into_owned();
     let response = tauri::http::Response::builder();
-    match thumbnail_bytes(Path::new(&path)) {
-        Ok(bytes) => response.header("Content-Type", "image/jpeg").header("Cache-Control", "max-age=31536000, immutable").body(bytes),
+    let asks = |name: &str| request.uri().query().is_some_and(|query| query.split('&').any(|part| part == name));
+    let animated = asks("animated");
+    if asks("original") {
+        let file = Path::new(&path);
+        return match picture_extension(file).as_deref() {
+            Some("gif") => fs::read(file).map_err(|error| error.to_string()),
+            _ => Err("Only a GIF is served whole".to_string()),
+        }
+        .and_then(|bytes| response.header("Content-Type", "image/gif").header("Cache-Control", "max-age=31536000, immutable").body(bytes).map_err(|error| error.to_string()))
+        .unwrap_or_else(|error| tauri::http::Response::builder().status(404).body(error.into_bytes()).unwrap_or_default());
+    }
+    match thumbnail_bytes(Path::new(&path), animated) {
+        Ok(bytes) => response.header("Content-Type", if animated { "image/gif" } else { "image/jpeg" }).header("Cache-Control", "max-age=31536000, immutable").body(bytes),
         Err(error) => response.status(404).header("Content-Type", "text/plain").body(error.into_bytes()),
     }
     .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
@@ -479,6 +501,7 @@ fn image_entry(path: &Path) -> Option<ImageEntry> {
         extension,
         size: metadata.len(),
         modified_ms: stores::modified_ms(&metadata),
+        added_ms: stores::added_ms(&metadata),
     })
 }
 
@@ -522,6 +545,17 @@ async fn delete_image(path: String, permanent: bool) -> Result<Deletion, String>
     })
     .await
     .map_err(|error| format!("Delete task failed: {error}"))?
+}
+
+/// Shows a folder, such as a store's, in the desktop's file manager.
+#[tauri::command]
+fn open_folder(path: String) -> Result<(), String> {
+    let folder = PathBuf::from(&path);
+    if !folder.is_dir() {
+        return Err(format!("{path} is not a folder."));
+    }
+    Command::new("xdg-open").arg(&folder).spawn().map_err(|error| format!("Cannot open {path}: {error}"))?;
+    Ok(())
 }
 
 /// Current details of pictures, such as ones just saved; None for pictures that are gone.
@@ -577,8 +611,11 @@ impl ModelWorker {
         fs::write(runtime_dir.join("advanced.py"), ADVANCED_SCRIPT).map_err(|e| e.to_string())?;
         fs::write(runtime_dir.join("downloads.py"), DOWNLOADS_SCRIPT).map_err(|e| e.to_string())?;
         fs::write(runtime_dir.join("worker_protocol.py"), PROTOCOL_SCRIPT).map_err(|e| e.to_string())?;
+        fs::write(runtime_dir.join("watermark.py"), WATERMARK_SCRIPT).map_err(|e| e.to_string())?;
 
-        let mut child = Command::new(python_executable())
+        let mut command = Command::new(python_executable());
+        runtime::clear_python_environment(&mut command);
+        let mut child = command
             .arg(&script_path)
             .arg("--worker")
             .arg(&models_dir)
@@ -833,7 +870,7 @@ async fn run_plugin(
 ) -> Result<String, String> {
     let worker_state = state.worker.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if !matches!(plugin.as_str(), "gfpgan" | "realesrgan" | "remove_bg" | "face_swap" | "hat" | "lanczos" | "restore") {
+        if !matches!(plugin.as_str(), "gfpgan" | "realesrgan" | "remove_bg" | "face_swap" | "hat" | "lanczos" | "restore" | "photo") {
             return Err(format!("Unsupported image plugin: {plugin}"));
         }
         if !scale.is_finite() || !(1.0..=4.0).contains(&scale) {
@@ -846,6 +883,9 @@ async fn run_plugin(
         let strength = strength.unwrap_or(1.0);
         if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
             return Err("Restoration strength must be between 0 and 1".into());
+        }
+        if plugin == "photo" && !matches!(option.as_str(), "realwebphoto-dat2" | "nomos2-hq-atd") {
+            return Err("Choose a supported photo upscaler".into());
         }
         if plugin == "restore" && (scale != 1.0 || !matches!(option.as_str(), "compressed" | "natural" | "jpeg" | "noise" | "motion")) {
             return Err("Choose a supported Restore detail mode at the original resolution".into());
@@ -893,7 +933,7 @@ async fn image_action(
 ) -> Result<serde_json::Value, String> {
     let worker_state = state.worker.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if !matches!(command.as_str(), "memory" | "unload" | "detect_faces" | "face_preview" | "edit" | "export" | "select" | "mask_edit" | "retouch" | "refine_edges" | "outpaint") {
+        if !matches!(command.as_str(), "memory" | "unload" | "detect_faces" | "face_preview" | "edit" | "export" | "select" | "mask_edit" | "retouch" | "refine_edges" | "outpaint" | "watermark") {
             return Err("Unsupported image action".into());
         }
         let work_dir = Builder::new().prefix("inpaint-edit-").tempdir().map_err(|e| e.to_string())?;
@@ -985,12 +1025,17 @@ pub fn run() {
         .manage(tray::TrayState::default())
         .manage(stores::StoresState::default())
         .manage(dropbox::DropboxState::default())
+        .manage(dropbox::WindowDrops::default())
         .plugin(tauri_plugin_dialog::init())
         .register_asynchronous_uri_scheme_protocol("thumb", |_context, request, responder| {
             tauri::async_runtime::spawn_blocking(move || responder.respond(thumbnail_response(&request)));
         })
         .setup(|app| {
             dropbox::start(app.handle());
+            if let Some(window) = app.get_webview_window("main") {
+                let handle = app.handle().clone();
+                let _ = window.with_webview(move |webview| dropbox::connect_window(&handle, &webview.inner()));
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1019,7 +1064,11 @@ pub fn run() {
             read_image_data,
             read_thumbnail_data,
             save_image,
+            animation::read_animation,
+            animation::animation_info,
+            animation::save_animation,
             image_entries,
+            open_folder,
             delete_image,
             loaded_models,
             loaded_plugins,
@@ -1044,6 +1093,12 @@ pub fn run() {
             stores::store_create,
             stores::store_update,
             stores::store_remove,
+            stores::store_set_hidden,
+            hidden::hidden_status,
+            hidden::hidden_unlock,
+            hidden::hidden_lock,
+            hidden::hidden_activity,
+            hidden::hidden_configure,
             stores::store_cached,
             stores::store_scan,
             immich::immich_settings,
@@ -1057,12 +1112,55 @@ pub fn run() {
             immich::immich_album,
             immich::immich_create_album,
             immich::immich_open,
+            immich::immich_albums,
+            immich::immich_album_pictures,
+            immich::immich_album_cover,
+            immich::immich_album_create,
+            immich::immich_album_rename,
+            immich::immich_album_set_cover,
+            immich::immich_album_delete,
+            immich::immich_album_pictures_set,
+            immich::immich_tags,
+            immich::immich_tag_index,
+            immich::immich_album_index,
+            albums::store_album_index,
+            immich::immich_tag_paths,
+            immich::immich_tag_create,
+            immich::immich_tag_rename,
+            immich::immich_tag_delete,
+            pictures::pictures_tag,
+            pictures::tag_rename,
+            pictures::tag_delete,
+            pictures::annotations_list,
+            pictures::annotation_create,
+            pictures::annotation_update,
+            pictures::annotation_delete,
+            pictures::store_tags,
+            pictures::picture_facts,
+            albums::albums_list,
+            albums::album_create,
+            albums::album_rename,
+            albums::album_move,
+            albums::album_set_cover,
+            albums::album_delete,
+            albums::album_add,
+            albums::album_remove,
+            albums::album_pictures,
+            albums::albums_of_picture,
+            pictures::picture_info,
+            pictures::picture_update,
+            pictures::picture_label,
+            pictures::labels_all,
+            pictures::label_create,
+            pictures::label_delete,
             dropbox::dropbox_status,
             dropbox::dropbox_configure,
             dropbox::dropbox_set,
             dropbox::dropbox_overlay_state,
             dropbox::dropbox_save_clipboard,
             dropbox::dropbox_open_settings,
+            dropbox::window_drop,
+            dropbox::window_drop_cancel,
         ])
         .build(context)
         .expect("error while building Inpaint");
@@ -1070,10 +1168,12 @@ pub fn run() {
     std::thread::spawn(prune_thumbnail_cache);
     server::start_saved(app.handle());
     tray::start(app.handle());
+    hidden::start(app.handle());
 
     app.run(move |_app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
             shutdown_state.shutdown();
+            db::checkpoint();
         }
     });
 }

@@ -1,9 +1,10 @@
 //! Inpaint's SQLite databases, both in the data directory.
 //!
 //! `inpaint.db` keeps settings and the user's data: the API server (with its token), Immich (with its
-//! API key), image stores, drop box and tray settings, and the editor's preferences, workflows and saved
-//! faces. Only the user can read it. `.cache/cache.db` keeps what can be rebuilt: store indexes and the
-//! thumbnail cache's sizes and last use. The JSON files used before are imported once.
+//! API key), image stores and their albums, drop box and tray settings, and the editor's preferences,
+//! workflows and saved faces. Only the user can read it. `.cache/cache.db` keeps what can be rebuilt:
+//! store indexes and the thumbnail cache's sizes and last use. The JSON files used before are imported
+//! once.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -24,9 +25,50 @@ CREATE TABLE IF NOT EXISTS stores (
     name TEXT NOT NULL,
     path TEXT NOT NULL UNIQUE,
     immich INTEGER NOT NULL DEFAULT 0,
-    immich_path TEXT NOT NULL DEFAULT ''
+    immich_path TEXT NOT NULL DEFAULT '',
+    immich_url TEXT NOT NULL DEFAULT '',
+    immich_key TEXT NOT NULL DEFAULT '',
+    hidden INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS albums (
+    id TEXT PRIMARY KEY,
+    store_id TEXT NOT NULL,
+    parent_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    cover_path TEXT NOT NULL DEFAULT '',
+    created_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS albums_store ON albums (store_id, parent_id);
+CREATE TABLE IF NOT EXISTS album_pictures (
+    album_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    added_ms INTEGER NOT NULL,
+    PRIMARY KEY (album_id, path)
+);
+CREATE INDEX IF NOT EXISTS album_pictures_path ON album_pictures (path);
+CREATE TABLE IF NOT EXISTS picture_meta (
+    path TEXT PRIMARY KEY,
+    favorite INTEGER NOT NULL DEFAULT 0,
+    rating INTEGER NOT NULL DEFAULT 0,
+    description TEXT NOT NULL DEFAULT '',
+    updated_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS labels (id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS labels_name ON labels (kind, name);
+CREATE TABLE IF NOT EXISTS picture_labels (path TEXT NOT NULL, label_id TEXT NOT NULL, PRIMARY KEY (path, label_id));
+CREATE INDEX IF NOT EXISTS picture_labels_label ON picture_labels (label_id);
+CREATE TABLE IF NOT EXISTS annotations (
+    id TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    x REAL NOT NULL,
+    y REAL NOT NULL,
+    width REAL NOT NULL,
+    height REAL NOT NULL,
+    text TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS annotations_path ON annotations (path, created_ms);
 ";
 
 pub(crate) const CACHE_SCHEMA: &str = "
@@ -37,6 +79,7 @@ CREATE TABLE IF NOT EXISTS store_pictures (
     extension TEXT NOT NULL,
     size INTEGER NOT NULL,
     modified_ms INTEGER NOT NULL,
+    added_ms INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (store_id, path)
 );
 CREATE INDEX IF NOT EXISTS store_pictures_newest ON store_pictures (store_id, modified_ms DESC, name);
@@ -46,6 +89,28 @@ CREATE TABLE IF NOT EXISTS store_scans (
     other_files INTEGER NOT NULL,
     scanned_ms INTEGER NOT NULL,
     scan_seconds REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS store_tag_index (
+    store_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    tags TEXT NOT NULL,
+    PRIMARY KEY (store_id, path)
+);
+CREATE TABLE IF NOT EXISTS store_tag_scans (store_id TEXT PRIMARY KEY, scanned_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS store_album_index (
+    store_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    tags TEXT NOT NULL,
+    PRIMARY KEY (store_id, path)
+);
+CREATE TABLE IF NOT EXISTS store_album_scans (store_id TEXT PRIMARY KEY, scanned_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS store_facts (
+    store_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    favorite INTEGER NOT NULL,
+    rating INTEGER NOT NULL,
+    added_ms INTEGER NOT NULL,
+    PRIMARY KEY (store_id, path)
 );
 CREATE TABLE IF NOT EXISTS thumbnails (file TEXT PRIMARY KEY, bytes INTEGER NOT NULL, last_used INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS thumbnails_last_used ON thumbnails (last_used);
@@ -109,7 +174,21 @@ fn open(path: &Path, private: bool) -> Result<Connection, String> {
     connection.busy_timeout(Duration::from_secs(5)).map_err(|error| failed(&error))?;
     connection.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(())).map_err(|error| failed(&error))?;
     connection.pragma_update(None, "synchronous", "NORMAL").map_err(|error| failed(&error))?;
+    // Fold the write-ahead log back sooner than SQLite's 1000 pages, so it stays around a megabyte.
+    connection.pragma_update(None, "wal_autocheckpoint", 256).map_err(|error| failed(&error))?;
     Ok(connection)
+}
+
+/// Adds columns a table gained since it was created, for databases made by an earlier version.
+fn add_columns(connection: &Connection, table: &str, columns: &[(&str, &str)]) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = statement.query_map([], |row| row.get::<_, String>(1))?.collect::<rusqlite::Result<_>>()?;
+    for (name, kind) in columns {
+        if !existing.iter().any(|column| column == name) {
+            connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {kind}"), [])?;
+        }
+    }
+    Ok(())
 }
 
 fn user_version(connection: &Connection) -> rusqlite::Result<i64> {
@@ -120,6 +199,7 @@ fn user_version(connection: &Connection) -> rusqlite::Result<i64> {
 pub(crate) fn migrate_settings(connection: &mut Connection, folder: &Path) -> Result<(), String> {
     let failed = |error: rusqlite::Error| format!("Cannot prepare the settings database: {error}");
     connection.execute_batch(SETTINGS_SCHEMA).map_err(failed)?;
+    add_columns(connection, "stores", &[("immich_url", "TEXT NOT NULL DEFAULT ''"), ("immich_key", "TEXT NOT NULL DEFAULT ''"), ("hidden", "INTEGER NOT NULL DEFAULT 0")]).map_err(failed)?;
     if user_version(connection).map_err(failed)? >= 1 {
         return Ok(());
     }
@@ -164,6 +244,7 @@ pub(crate) fn migrate_settings(connection: &mut Connection, folder: &Path) -> Re
 pub(crate) fn migrate_cache(connection: &mut Connection, folder: &Path) -> Result<(), String> {
     let failed = |error: rusqlite::Error| format!("Cannot prepare the cache database: {error}");
     connection.execute_batch(CACHE_SCHEMA).map_err(failed)?;
+    add_columns(connection, "store_pictures", &[("added_ms", "INTEGER NOT NULL DEFAULT 0")]).map_err(failed)?;
     if user_version(connection).map_err(failed)? >= 1 {
         return Ok(());
     }
@@ -192,6 +273,21 @@ pub(crate) fn migrate_cache(connection: &mut Connection, folder: &Path) -> Resul
     transaction.commit().map_err(failed)?;
     let _ = fs::remove_dir_all(indexes);
     Ok(())
+}
+
+/// Writes a database's log back into it and empties the log file.
+fn checkpoint_one(connection: &Connection, name: &str) {
+    if let Err(error) = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+        eprintln!("Cannot write {name}'s log back into it: {error}");
+    }
+}
+
+/// Folds both write-ahead logs back into their databases. The connections live as long as the process
+/// and the app exits without dropping them, so SQLite never gets the close that would do this itself,
+/// which is why a small database could sit beside a log of many megabytes.
+pub fn checkpoint() {
+    checkpoint_one(&settings_db(), "inpaint.db");
+    checkpoint_one(&cache_db(), "cache.db");
 }
 
 /// A setting saved as JSON: None when never saved, an error when it no longer fits the type.
@@ -312,6 +408,25 @@ mod tests {
         let bytes: i64 = connection.query_row("SELECT bytes FROM thumbnails WHERE file = '0011.jpg'", [], |row| row.get(0)).unwrap();
         assert_eq!(bytes, 42);
         assert!(!folder.path().join(".cache/stores").exists());
+    }
+
+    #[test]
+    fn a_checkpoint_empties_the_write_ahead_log() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("inpaint.db");
+        let connection = open(&path, true).unwrap();
+        connection.execute_batch(SETTINGS_SCHEMA).unwrap();
+        for index in 0..500 {
+            connection.execute("INSERT INTO preferences (key, value) VALUES (?1, ?2)", params![format!("inpaint.k{index}"), "x".repeat(4000)]).unwrap();
+        }
+        let log = folder.path().join("inpaint.db-wal");
+        assert!(fs::metadata(&log).unwrap().len() > 0, "the writes went to the log");
+        checkpoint_one(&connection, "inpaint.db");
+        assert_eq!(fs::metadata(&log).unwrap().len(), 0, "the log was folded back and emptied");
+        assert!(fs::metadata(&path).unwrap().len() > 0);
+        // The rows are still there afterwards.
+        let kept: i64 = connection.query_row("SELECT COUNT(*) FROM preferences", [], |row| row.get(0)).unwrap();
+        assert_eq!(kept, 500);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import Select from "./Select";
 type Status = { ready: boolean; running: boolean; stage: string; log: string[]; directory: string; error?: string };
 type Progress = { label: string; detail: string; percent?: number; done?: boolean };
 
@@ -23,7 +24,7 @@ export default function RuntimeSetup({ children }: { children: ReactNode }) {
   }, []);
   if (!status?.ready) return <div className="setup-backdrop"><section className="setup-card">
     <h1>Set up Inpaint</h1><p>Install the private Python runtime and editing tools. Models download only when you use them.</p>
-    <label>Processing hardware<select disabled={status?.running} value={gpu ? "gpu" : "cpu"} onChange={(e) => setGpu(e.target.value === "gpu")}><option value="gpu">NVIDIA GPU · CUDA 12.8 driver required</option><option value="cpu">CPU · Any supported Linux machine</option></select></label>
+    <label>Processing hardware<Select disabled={status?.running} value={gpu ? "gpu" : "cpu"} onChange={(e) => setGpu(e.target.value === "gpu")}><option value="gpu">NVIDIA GPU · CUDA 12.8 driver required</option><option value="cpu">CPU · Any supported Linux machine</option></Select></label>
     <p className="path-text">Storage: {status?.directory || "Locating application storage…"}</p>
     <p>The initial installation needs internet access and several gigabytes of disk space. Your pictures stay on this computer.</p>
     {status?.running && <><strong>{status.stage}</strong><progress /><pre>{status.log.slice(-12).join("\n")}</pre></>}

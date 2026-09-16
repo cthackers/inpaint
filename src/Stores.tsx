@@ -71,6 +71,7 @@ export function SourcePicker({ stores, activeStore, onOpenFolder, onNewStore, on
 
 type PanelProps = {
   store: Store;
+  revealed?: boolean;
   stats: StoreStats | null;
   progress: { done: number; total: number } | null;
   error: string;
@@ -80,15 +81,19 @@ type PanelProps = {
 };
 
 /** Sidebar details of the open store: statistics, rescan, rename, remove and Immich settings. */
-export function StorePanel({ store, stats, progress, error, onRescan, onChange, onRemove }: PanelProps) {
+export function StorePanel({ store, revealed = false, stats, progress, error, onRescan, onChange, onRemove }: PanelProps) {
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(store.name);
   const [immichPath, setImmichPath] = useState(immichDefault(store));
+  const [immichUrl, setImmichUrl] = useState(store.immichUrl);
+  const [immichKey, setImmichKey] = useState(store.immichKey);
   const [message, setMessage] = useState("");
   useEffect(() => {
     setRenaming(false);
     setName(store.name);
     setImmichPath(immichDefault(store));
+    setImmichUrl(store.immichUrl);
+    setImmichKey(store.immichKey);
     setMessage("");
   }, [store.id]);
 
@@ -118,7 +123,11 @@ export function StorePanel({ store, stats, progress, error, onRescan, onChange, 
           <button type="button" onClick={() => { setName(store.name); setRenaming(false); }}>Cancel</button>
         </form>
       : <strong className="store-name" title={store.name}>{store.name}</strong>}
-    <span className="store-path" title={store.path}>{store.path}</span>
+    <label className="store-field">Folder<span className="server-token">
+      <input className="store-path" readOnly value={store.path} title={store.path} onFocus={(event) => event.target.select()} />
+      <button type="button" className="icon-button" title="Open this folder" aria-label="Open this folder"
+        onClick={() => void invoke("open_folder", { path: store.path }).catch((failure) => setMessage(String(failure)))}><FolderOpen size={16} /></button>
+    </span></label>
     <dl className="store-stats">
       <dt>Pictures</dt><dd>{stats ? stats.pictures.toLocaleString() : "…"}</dd>
       <dt>Size</dt><dd>{stats ? formatBytes(stats.bytes) : "…"}</dd>
@@ -135,6 +144,8 @@ export function StorePanel({ store, stats, progress, error, onRescan, onChange, 
       <button onClick={() => setRenaming(true)}><Pencil size={14} /> Rename</button>
       <button onClick={() => void remove()}><Trash2 size={14} /> Remove</button>
     </div>
+    {revealed && <label className="check-label"><input type="checkbox" checked={store.hidden}
+      onChange={(event) => void invoke<Store>("store_set_hidden", { id: store.id, hidden: event.target.checked }).then(onChange).catch((failure) => setMessage(String(failure)))} /> Hide store</label>}
     <label className="check-label"><input type="checkbox" checked={store.immich} onChange={(event) => void save({ immich: event.target.checked, immichPath })} /> Immich compatible</label>
     {store.immich && <>
       <label className="store-field">Folder as Immich sees it
@@ -142,7 +153,17 @@ export function StorePanel({ store, stats, progress, error, onRescan, onChange, 
           onBlur={() => { if (immichPath !== store.immichPath) void save({ immichPath }); }}
           onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} />
       </label>
-      <small>After a picture of this store is saved in Inpaint, Immich rebuilds its thumbnail. Enter Immich's address and API key in Settings.</small>
+      <label className="store-field">Immich address for this store
+        <input value={immichUrl} placeholder="Uses the address in Settings" onChange={(event) => setImmichUrl(event.target.value)}
+          onBlur={() => { if (immichUrl !== store.immichUrl) void save({ immichUrl }); }}
+          onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} />
+      </label>
+      <label className="store-field">API key for this store
+        <input type="password" value={immichKey} placeholder="Uses the key in Settings" autoComplete="off" onChange={(event) => setImmichKey(event.target.value)}
+          onBlur={() => { if (immichKey !== store.immichKey) void save({ immichKey }); }}
+          onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} />
+      </label>
+      <small>After a picture of this store is saved in Inpaint, Immich rebuilds its thumbnail. Leave the address and key empty to use the ones in Settings; fill them in for a store on another server or with its own key.</small>
     </>}
     {message && <p className="store-error">{message}</p>}
   </div>;

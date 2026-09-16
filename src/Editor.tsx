@@ -1,24 +1,28 @@
-import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { confirm, open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft, ArrowRight, Brush, Check, Eraser, LoaderCircle,
-  ChevronDown, Eye, EyeOff, FlipHorizontal, FlipVertical, ImageOff, Maximize2, Play, Redo2, RotateCcw, RotateCw,
-  Save, Scan, ScanFace, Sparkles, Tags, Trash2, Undo2, UserRound, X, ZoomIn, ZoomOut, Crop, History, Layers, Download, SlidersHorizontal,
+  ChevronDown, Eye, EyeOff, FlipHorizontal, FlipVertical, ImageOff, Maximize2, Minimize2, Pause, Play, Redo2, RotateCcw, RotateCw,
+  Save, Scan, ScanFace, Sparkles, Stamp, Tags, Trash2, Undo2, UserRound, X, ZoomIn, ZoomOut, Crop, History, Layers, Download, SlidersHorizontal, Images, Cpu, Gauge, ImagePlus, LayoutGrid, StickyNote,
 } from "lucide-react";
 import type { ImageEntry, Store } from "./types";
 import ImmichPanel from "./ImmichPanel";
-import Workspace, { type WorkspaceTab } from "./Workspace";
+import PictureInfo from "./PictureInfo";
+import AnnotationsPanel, { type Annotation } from "./Annotations";
+import Workspace, { type WorkspaceCommand, type WorkspaceTab } from "./Workspace";
 import { useEditHistory, type HistoryEntry } from "./useEditHistory";
-import { adjustImage, neutralAdjustments, loadImage, blendImages, executeOperation, imageAction, type FaceBox, type Operation, type Rect } from "./editorOperations";
-import AdvancedTools, { BackgroundEdgeTools, type BrushTool, type BrushSettings, type Edges, type Extension } from "./AdvancedTools";
+import { adjustImage, neutralAdjustments, loadImage, blendImages, executeOperation, imageAction, RESIZE_FILTERS, WATERMARK_PROMPTS, watermarkPrompts, type ActionResult, type FaceBox, type Operation, type Rect, type ResizeFilter } from "./editorOperations";
+import advancedSections, { BackgroundEdgeTools, type BrushTool, type BrushSettings, type Edges, type Extension } from "./AdvancedTools";
 import { INPAINT_MODELS, type InpaintModel } from "./models";
 import FaceLibrary from "./FaceLibrary";
 import { FACE_LIBRARY_PREFERENCE, usePreference, useSavedChoice } from "./preferences";
-import ToolSection from "./ToolSection";
+import ToolSection, { SECTION_DRAG, type SectionEntry } from "./ToolSection";
+import { comboOf, keyLabel, shortcutFor, SHORTCUTS, useShortcutKeys, type ShortcutId } from "./shortcuts";
 import { useCanvasView } from "./useCanvasView";
 import { appendMaskHistory, applyMaskSnapshot, captureMaskRegion, emptySnapshot, snapshotMask, type MaskSnapshot } from "./maskHistory";
 import { storage } from "./storage";
+import Select from "./Select";
 
 type EditorProps = {
   image: ImageEntry;
@@ -43,11 +47,67 @@ type EditorProps = {
   onDeleted?: (path: string) => void;
   /** Image stores marked Immich compatible; their pictures get the Immich panel. */
   immichStores?: Store[];
+  /** Whether the strip of pictures lies along the bottom; App draws it, outside this editor. */
+  stripOpen?: boolean;
+  onStripToggle?: () => void;
+  /** Where the picture area is, for the strip, which lies along its bottom. */
+  onViewport?: (box: { left: number; width: number; bottom: number }) => void;
+  /** Whether an action or a save is running, which keeps the strip from moving to another picture. */
+  onBusy?: (busy: boolean) => void;
+  /** Filled with a way to open another picture, with the same questions as the arrows ask. */
+  navigator?: MutableRefObject<((index: number) => void) | null>;
+  /** The picture as it stood on screen when another one opens, so App can let it fade out. */
+  onLeaving?: (snapshot: { src: string; rect: DOMRect }) => void;
+  /** The picture has painted in place. */
+  onShown?: () => void;
 };
 
 export type FaceSwapSource = { path: string; data: string };
 
+type AnimationInfo = { frames: number; editable: boolean };
+type Animation = { frames: string[]; delays: number[] };
+
 type Point = { x: number; y: number };
+
+/** The crop's handles, named by the sides they move. */
+const CROP_HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"] as const;
+const MIN_CROP = .01;
+
+/**
+ * The crop after dragging a handle (or its inside, "move") by dx, dy, as fractions of the picture. With a
+ * ratio (width over height, in those fractions) the crop keeps its shape: a corner follows the pointer's
+ * width from the opposite corner, and a side grows the other dimension around its middle.
+ */
+function dragCrop(handle: string, [x, y, width, height]: Rect, dx: number, dy: number, ratio: number): Rect {
+  const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value));
+  if (handle === "move") return [clamp(x + dx, 0, 1 - width), clamp(y + dy, 0, 1 - height), width, height];
+  let left = x, top = y, right = x + width, bottom = y + height;
+  if (handle.includes("w")) left = clamp(x + dx, 0, right - MIN_CROP);
+  if (handle.includes("e")) right = clamp(right + dx, left + MIN_CROP, 1);
+  if (handle.includes("n")) top = clamp(y + dy, 0, bottom - MIN_CROP);
+  if (handle.includes("s")) bottom = clamp(bottom + dy, top + MIN_CROP, 1);
+  if (!ratio) return [left, top, right - left, bottom - top];
+  if (handle.length === 2) {
+    // The corner opposite the handle stays put.
+    const anchorX = handle.includes("w") ? x + width : x, anchorY = handle.includes("n") ? y + height : y;
+    const roomX = handle.includes("w") ? anchorX : 1 - anchorX, roomY = handle.includes("n") ? anchorY : 1 - anchorY;
+    // The side the pointer moved further decides the size.
+    const byWidth = right - left, byHeight = (bottom - top) * ratio;
+    const wanted = Math.abs(byWidth - width) >= Math.abs(byHeight - width) ? byWidth : byHeight;
+    const newWidth = clamp(wanted, MIN_CROP, Math.min(roomX, roomY * ratio));
+    const newHeight = newWidth / ratio;
+    return [handle.includes("w") ? anchorX - newWidth : anchorX, handle.includes("n") ? anchorY - newHeight : anchorY, newWidth, newHeight];
+  }
+  const centerX = x + width / 2, centerY = y + height / 2;
+  if (handle === "n" || handle === "s") {
+    const room = Math.min(centerX, 1 - centerX) * 2;
+    const newHeight = Math.min(bottom - top, room / ratio), newWidth = newHeight * ratio;
+    return [centerX - newWidth / 2, handle === "n" ? bottom - newHeight : top, newWidth, newHeight];
+  }
+  const room = Math.min(centerY, 1 - centerY) * 2;
+  const newWidth = Math.min(right - left, room * ratio), newHeight = newWidth / ratio;
+  return [handle === "w" ? right - newWidth : left, centerY - newHeight / 2, newWidth, newHeight];
+}
 type PendingLeave = { kind: "exit" } | { kind: "navigate"; offset: number } | { kind: "replace" };
 
 const IMAGE_TRANSFORMS = [
@@ -57,6 +117,8 @@ const IMAGE_TRANSFORMS = [
   { id: "rotate-right", label: "Rotate right 90°", icon: RotateCw },
 ] as const;
 const UPSCALE_OPTIONS = [
+  { id: "realwebphoto-dat2", plugin: "photo", name: "DAT2 · Natural photos", description: "Keeps the photo's own texture instead of smoothing it, and copes with JPEG compression. The best choice for most photos. 140 MB download." },
+  { id: "nomos2-hq-atd", plugin: "photo", name: "ATD · Finest detail", description: "The most real detail, for clean sources such as PNG or camera exports. Sharpens JPEG artifacts, so use DAT2 for compressed pictures. 82 MB download." },
   { id: "hat-sharper", plugin: "hat", name: "Real-HAT · Sharper", description: "Sharper AI reconstruction. Slower than RealESRGAN." },
   { id: "RealESRGAN_x4plus", plugin: "realesrgan", name: "RealESRGAN x4+ · Photos", description: "General-purpose photo restoration and upscaling." },
   { id: "realesr-general-x4v3", plugin: "realesrgan", name: "RealESRGAN General v3", description: "Lower denoising keeps more texture and grain." },
@@ -73,7 +135,27 @@ const RESTORE_OPTIONS = [
   { id: "motion", name: "Motion blur", description: "Reduces blur from camera shake or movement with Restormer.", download: "about 100 MB" },
 ] as const;
 
-export default function Editor({ image, index, total, brushSize, onBrushSizeChange, faceSwapSource, onFaceSwapSourceChange, onFaceSwapSourceClear, onExit, onNavigate, initialData, replaceRequested, onReplace, onReplaceCancel, onSaved, onDeleted, immichStores }: EditorProps) {
+// How far the tools on the left were scrolled, kept while another picture opens.
+let toolbarScroll = 0;
+// Commands asked of the workspace by shortcuts, numbered so each one runs once.
+let workspaceCommands = 0;
+// The size of the picture opened last, which the next one shows until its own is known.
+let lastDimensions = { width: 1, height: 1 };
+
+type DockTab = WorkspaceTab | "info" | "annotations";
+
+/** The panels of the dock on the right, in the order their tabs stand. */
+const DOCK_TABS: { id: DockTab; label: string; icon: typeof History }[] = [
+  { id: "info", label: "Info", icon: Tags },
+  { id: "annotations", label: "Annotations", icon: StickyNote },
+  { id: "history", label: "History", icon: History },
+  { id: "workflows", label: "Workflows", icon: Layers },
+  { id: "batch", label: "Batch", icon: Images },
+  { id: "export", label: "Export", icon: Download },
+  { id: "memory", label: "Memory", icon: Cpu },
+];
+
+export default function Editor({ image, index, total, brushSize, onBrushSizeChange, faceSwapSource, onFaceSwapSourceChange, onFaceSwapSourceClear, onExit, onNavigate, initialData, replaceRequested, onReplace, onReplaceCancel, onSaved, onDeleted, immichStores, stripOpen = false, onStripToggle, onViewport, onBusy, navigator, onLeaving, onShown }: EditorProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const maskRef = useRef<HTMLCanvasElement>(null);
   const drawing = useRef(false);
@@ -90,7 +172,16 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   const imageData = history.data;
   const dirty = history.dirty;
   const [originalImageData, setOriginalImageData] = useState("");
-  const [dimensions, setDimensions] = useState({ width: 1, height: 1 });
+  // An animated GIF keeps its frames as they came from disk. The first one is edited on screen, and Save
+  // runs the same history on every other frame.
+  const [animation, setAnimation] = useState<AnimationInfo | null>(null);
+  const [animationPaused, setAnimationPaused] = useState(false);
+  // The frames as they were when the picture opened; after a Save the file holds edited ones.
+  const animationFrames = useRef<Animation | null>(null);
+  // Starts at the last picture's size rather than 1 × 1, so the sizes shown in the panels change once,
+  // from that picture to this one, instead of dropping to 1 × 1 while this one loads.
+  const [dimensions, setDimensions] = useState(() => lastDimensions);
+  useEffect(() => { lastDimensions = dimensions; }, [dimensions]);
   const [fitScale, setFitScale] = useState(1);
   const [maskDirty, commitMaskDirty] = useState(false);
   const maskDirtyRef = useRef(false);
@@ -112,6 +203,9 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     return INPAINT_MODELS.find((option) => option.id === saved) ?? INPAINT_MODELS[0];
   });
   const [prompt, setPrompt] = usePreference("inpaint.prompt", "");
+  const [watermarkText, setWatermarkText] = usePreference("inpaint.watermarkPrompts", WATERMARK_PROMPTS.join(", "));
+  const [watermarkMaxPercent, setWatermarkMaxPercent] = usePreference("inpaint.watermarkMaxPercent", 10, (value) => value >= 1 && value <= 100);
+  const watermarkOperation: Operation = { kind: "watermark", label: `Remove watermarks · ${model.name}`, prompts: watermarkPrompts(watermarkText), maxPercent: watermarkMaxPercent, model: model.id, prompt };
   const [stageReady, setStageReady] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
   const [pendingLeave, setPendingLeave] = useState<PendingLeave | null>(null);
@@ -120,6 +214,9 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   const selectedRestore = RESTORE_OPTIONS.find((option) => option.id === restoreMode)!;
   const [upscaleModel, setUpscaleModel] = useSavedChoice<string>("inpaint.upscaleModel", UPSCALE_OPTIONS.map((option) => option.id));
   const [upscaleScale, setUpscaleScale] = useSavedChoice<number>("inpaint.upscaleScale", [2, 3, 4]);
+  // Downscaling: the longest side the picture should have, and the filter that gets it there.
+  const [downscaleLongest, setDownscaleLongest] = usePreference("inpaint.downscaleLongest", 2048, (value) => value >= 16 && value <= 32768);
+  const [downscaleFilter, setDownscaleFilter] = useSavedChoice<ResizeFilter>("inpaint.downscaleFilter", RESIZE_FILTERS.map((filter) => filter.id));
   const [upscaleDenoise, setUpscaleDenoise] = useSavedChoice<number>("inpaint.upscaleDenoise", [25, ...Array.from({ length: 21 }, (_, index) => index * 5)]);
   const selectedUpscaler = UPSCALE_OPTIONS.find((option) => option.id === upscaleModel)!;
   const [backgroundModel, setBackgroundModel] = useSavedChoice<string>("inpaint.backgroundModel", [
@@ -145,8 +242,13 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     finally { setHfTokenBusy(false); }
   };
 
-  const [workspaceOpen, setWorkspaceOpen] = usePreference("inpaint.workspaceOpen", false);
-  const [workspaceTab, setWorkspaceTab] = useSavedChoice<WorkspaceTab>("inpaint.workspaceTab", ["history", "workflows", "batch", "export", "memory"]);
+  // The dock on the right shows one panel at a time, chosen in its vertical tabs; "" keeps it closed.
+  const [dockTab, setDockTab] = useSavedChoice<DockTab | "">("inpaint.dockTab", ["", "history", "workflows", "batch", "export", "memory", "info", "annotations"]);
+  const [workspaceCommand, setWorkspaceCommand] = useState<WorkspaceCommand>({ name: "run-workflow", count: 0 });
+  const toolbar = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    if (toolbar.current) toolbar.current.scrollTop = toolbarScroll;
+  }, []);
   const [compare, setCompare] = useState(false);
   const [divider, setDivider] = usePreference("inpaint.divider", 50, (value) => value >= 0 && value <= 100);
   const [compareWith, setCompareWith] = useSavedChoice<string>("inpaint.compareWith", ["previous", "original"]);
@@ -161,6 +263,8 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   const [cropRatio, setCropRatio] = useSavedChoice<number>("inpaint.cropRatio", [0, 1, 4/3, 3/2, 16/9, 3/4, 2/3, 9/16]);
   const [cropAngle, setCropAngle] = useState(0);
   const cropStart = useRef<Point | null>(null);
+  // A handle or the inside of the crop being dragged: which one, where the drag began, and the crop then.
+  const cropDrag = useRef<{ handle: string; start: Point; rect: Rect } | null>(null);
   const [backgroundType, setBackgroundType] = useSavedChoice<"color" | "image" | "blur">("inpaint.backgroundType", ["color", "image", "blur"]);
   const [backgroundColor, setBackgroundColor] = usePreference("inpaint.backgroundColor", "#ffffff");
   const [backgroundPath, setBackgroundPath] = usePreference("inpaint.backgroundPath", "");
@@ -184,11 +288,50 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     if (path) setFaceLibrary((saved) => (saved.includes(path) ? saved : [path, ...saved]));
   }, [faceSwapSource?.path]);
   const [deleting, setDeleting] = useState(false);
-  const [immichOpen, setImmichOpen] = usePreference("inpaint.immichPanel", true);
-  const { stageRef, cursorRef, zoomLabelRef, zoomValueRef, panRef, zoomRef, zoom, setPan, setZoom, getViewportBounds, moveCursor, hideCursor } = useCanvasView(
-    viewportRef, fitScale, brushSize, !!imageData && !working && !showOriginal && !compare && !cropMode && !selectingFace,
+  // Annotations: the picture's notes, whether they show, drawing a new one and the one being pointed at.
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [annotationsVisible, setAnnotationsVisible] = usePreference("inpaint.annotationsVisible", true);
+  const [annotating, setAnnotating] = useState(false);
+  const noteStart = useRef<{ x: number; y: number } | null>(null);
+  const [noteDraft, setNoteDraft] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
+  const [notePending, setNotePending] = useState(false);
+  const [noteText, setNoteText] = useState("");
+  const [pointedNote, setPointedNote] = useState<string | null>(null);
+  const [listedNote, setListedNote] = useState<string | null>(null);
+  // Picking a point (a smart selection, or the source of the clone stamp or healing brush with Alt) shows a
+  // crosshair instead of the brush circle.
+  const [altHeld, setAltHeld] = useState(false);
+  useEffect(() => {
+    const note = (event: KeyboardEvent) => setAltHeld(event.altKey);
+    const release = () => setAltHeld(false);
+    window.addEventListener("keydown", note);
+    window.addEventListener("keyup", note);
+    window.addEventListener("blur", release);
+    return () => {
+      window.removeEventListener("keydown", note);
+      window.removeEventListener("keyup", note);
+      window.removeEventListener("blur", release);
+    };
+  }, []);
+  const pickingPoint = brushTool === "smart" || ((brushTool === "clone" || brushTool === "heal") && (altHeld || !cloneSource));
+  const { stageRef, cursorRef, zoomLabelRef, zoomValueRef, panRef, zoomRef, zoom, setPan, setZoom, glideTo, zoomAround, targetZoom, getViewportBounds, moveCursor, hideCursor } = useCanvasView(
+    viewportRef, fitScale, brushSize, !!imageData && !working && !showOriginal && !compare && !cropMode && !selectingFace && !annotating && !pickingPoint,
   );
   const scale = fitScale * zoom;
+
+  // The picture on screen, for the fade when another one opens.
+  // "Loading image" only appears when a picture takes a while; a quick switch would just flash it.
+  const [slowLoad, setSlowLoad] = useState(false);
+  useEffect(() => {
+    setSlowLoad(false);
+    if (imageData) return;
+    const late = window.setTimeout(() => setSlowLoad(true), 450);
+    return () => window.clearTimeout(late);
+  }, [imageData]);
+  const leavingSource = useRef("");
+  leavingSource.current = imageData;
+  const leaving = useRef(onLeaving);
+  leaving.current = onLeaving;
 
   const clearMask = useCallback(() => {
     const canvas = maskRef.current;
@@ -196,11 +339,65 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     setMaskDirty(false);
   }, []);
 
+  // Another picture opens in the same editor, so the panels, the strip and the scroll stay put. What
+  // belonged to the last picture is put back, and the picture on screen is handed over to fade out.
+  const shownPath = useRef("");
   useEffect(() => {
     let active = true;
+    const stage = stageRef.current;
+    if (shownPath.current && shownPath.current !== image.path && stage && leavingSource.current) {
+      leaving.current?.({ src: leavingSource.current, rect: stage.getBoundingClientRect() });
+    }
+    shownPath.current = image.path;
     history.reset("");
     setOriginalImageData("");
+    setAnimation(null);
+    animationFrames.current = null;
     setMessage("");
+    clearMask();
+    strokeSnapshot.current = null;
+    drawing.current = false;
+    autoApplyStroke.current = false;
+    setFaces([]);
+    setSelectingFace(false);
+    setSelectedFace(null);
+    setAssignments({});
+    setCropMode(false);
+    setCropRect([0, 0, 1, 1]);
+    setCropAngle(0);
+    cropStart.current = null;
+    setSmartPoints([]);
+    setCloneSource(null);
+    retouchStroke.current = [];
+    setCompare(false);
+    setRestorationPreview(null);
+    setColorPreview("");
+    setAdjustmentActive(false);
+    setDeleting(false);
+    setAnnotations([]);
+    setAnnotating(false);
+    noteStart.current = null;
+    setNoteDraft(null);
+    setNotePending(false);
+    setNoteText("");
+    setPointedNote(null);
+    setListedNote(null);
+    if (image.path) {
+      void invoke<Annotation[]>("annotations_list", { path: image.path })
+        .then((notes) => { if (active) setAnnotations(notes); })
+        .catch((error) => { if (active) setMessage(String(error)); });
+    }
+    setSavePath(/^(png|jpe?g|webp)$/.test(image.extension) ? image.path : "");
+    // The GIF plays from its file; its frames are only read when Save edits them all.
+    if (!initialData && image.extension === "gif" && image.path) {
+      void invoke<AnimationInfo | null>("animation_info", { path: image.path })
+        .then((info) => {
+          if (!active || !info) return;
+          setAnimation(info);
+          if (info.editable) setSavePath(image.path);
+        })
+        .catch(() => undefined);
+    }
 
     setMaskUndo([]);
     setMaskRedo([]);
@@ -354,7 +551,9 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     setMessage("Saving…");
     try {
       // Pictures of Immich-compatible image stores come back with a note about Immich.
-      const note = await invoke<string | null>("save_image", { path, imageData });
+      const note = animation?.editable && path === image.path
+        ? await saveAnimation(path)
+        : await invoke<string | null>("save_image", { path, imageData });
       setSavePath(path);
       history.markSaved();
       onSaved?.(path);
@@ -367,7 +566,31 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     } finally {
       setSaving(false);
     }
-  }, [image.name, image.path, image.extension, savePath, imageData, saving, working, onSaved]);
+  }, [image.name, image.path, image.extension, savePath, imageData, saving, working, onSaved, animation, history.entries, history.position]);
+
+  /** Runs the edits of the history, up to the one shown, on every frame, and writes the animation. */
+  const saveAnimation = async (path: string) => {
+    const steps = history.entries.slice(1, history.position + 1);
+    const missing = steps.find((entry) => !entry.operation);
+    if (missing) throw new Error(`“${missing.label}” cannot be repeated on the other frames`);
+    setMessage("Reading the frames…");
+    const source = animationFrames.current ?? await invoke<Animation | null>("read_animation", { path });
+    if (!source) throw new Error("The picture is no longer animated");
+    animationFrames.current = source;
+    const frames = [imageData];
+    for (let frame = 1; frame < source.frames.length; frame++) {
+      let data = source.frames[frame];
+      for (const [step, entry] of steps.entries()) {
+        setMessage(steps.length > 1
+          ? `Editing frame ${frame + 1} of ${source.frames.length} · ${step + 1}/${steps.length} ${entry.label}…`
+          : `Editing frame ${frame + 1} of ${source.frames.length}…`);
+        data = await executeOperation(data, entry.operation!, source.frames[frame]);
+      }
+      frames.push(data);
+    }
+    setMessage("Saving…");
+    return invoke<string | null>("save_animation", { path, frames, delays: source.delays });
+  };
 
   const getBinaryMask = () => {
     const source = maskRef.current!;
@@ -396,13 +619,8 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       setMessage(loadedModels.includes(model.id)
         ? `Removing selection with ${model.name}…`
         : `Loading ${model.name}…`);
-      const result = await invoke<string>("run_inpaint", {
-        imageData,
-        maskData: getBinaryMask(),
-        model: model.id,
-        prompt,
-      });
-      commitEdit(result, `Inpaint · ${model.name}`);
+      const operation: Operation = { kind: "inpaint", label: `Inpaint · ${model.name}`, mask: getBinaryMask(), model: model.id, prompt };
+      commitEdit(await executeOperation(imageData, operation, originalImageData), operation.label, operation);
       setMessage(`Object removed with ${model.name}`);
       window.setTimeout(() => setMessage(""), 1600);
     } catch (error) {
@@ -423,6 +641,37 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     if (dirty) setPendingLeave({ kind: "navigate", offset });
     else onNavigate(offset);
   }, [dirty, onNavigate, saving, working]);
+
+  useEffect(() => {
+    if (!navigator) return;
+    navigator.current = (target) => safeNavigate(target - index);
+    return () => { navigator.current = null; };
+  }, [navigator, safeNavigate, index]);
+  useEffect(() => { onBusy?.(working || saving); }, [onBusy, working, saving]);
+  const viewportReport = useRef(onViewport);
+  viewportReport.current = onViewport;
+  useLayoutEffect(() => {
+    const element = viewportRef.current;
+    if (!element) return;
+    const report = () => {
+      const box = element.getBoundingClientRect();
+      // While the strip is open the picture area stops above it; the strip lies in the margin below.
+      const below = parseFloat(getComputedStyle(element).marginBottom) || 0;
+      viewportReport.current?.({ left: box.left, width: box.width, bottom: box.bottom + below });
+    };
+    report();
+    const observer = new ResizeObserver(report);
+    observer.observe(element);
+    window.addEventListener("resize", report);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", report);
+    };
+  // The picture area only moves when the panels beside it open, close or resize, which the observer sees.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dockTab]);
+  useEffect(() => { if (stageReady) onShown?.(); }, [stageReady, onShown]);
+
 
   const replaceHandled = useRef(false);
   useEffect(() => {
@@ -564,7 +813,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       strength: restorationStrength / 100, colorMatch: faceColorMatch / 100, target: box ? [box[0] + box[2] / 2, box[1] + box[3] / 2] : undefined });
   };
 
-  const runImagePlugin = async (plugin: "gfpgan" | "realesrgan" | "remove_bg" | "face_swap" | "hat" | "lanczos", option: string, pluginScale: number, label: string) => {
+  const runImagePlugin = async (plugin: "gfpgan" | "realesrgan" | "remove_bg" | "face_swap" | "hat" | "lanczos" | "photo", option: string, pluginScale: number, label: string) => {
     if (plugin === "face_swap") {
       if (!activeFaceSource || choosingFace) return;
       await replaceFace(activeFaceSource.path);
@@ -605,7 +854,12 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     color: backgroundColor, path: backgroundPath, blur: backgroundBlur, removeFirst, model: backgroundModel };
   const restoreOperation: Operation = { kind: "plugin", plugin: "restore", option: restoreMode,
     scale: 1, denoise: 0, strength: restoreStrength / 100, label: `Restore detail · ${selectedRestore.name} · ${restoreStrength}%` };
+  const downscaleFilterInfo = RESIZE_FILTERS.find((filter) => filter.id === downscaleFilter) ?? RESIZE_FILTERS[0];
+  const downscaleOperation: Operation = { kind: "resize", label: `Downscale to ${downscaleLongest} px · ${downscaleFilterInfo.name}`, longest: downscaleLongest, filter: downscaleFilter };
+  const downscaleRatio = Math.min(1, downscaleLongest / Math.max(dimensions.width, dimensions.height));
+  const downscaled = { width: Math.max(1, Math.round(dimensions.width * downscaleRatio)), height: Math.max(1, Math.round(dimensions.height * downscaleRatio)) };
   const suggestions: Operation[] = [
+    downscaleOperation,
     restoreOperation,
     { kind: "adjust", label: "Color and lighting", values: adjustments },
     { kind: "refine_edges", label: "Refine background edges", ...edges },
@@ -616,6 +870,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     backgroundOperation,
     ...IMAGE_TRANSFORMS.map(({ id, label }) => ({ kind: "transform" as const, direction: id, label })),
     { kind: "crop", label: "Crop and straighten", rect: cropRect, angle: cropAngle },
+    watermarkOperation,
   ];
   if (faceSwapSource) suggestions.unshift({ kind: "face", label: `Face replace · ${restorationStrength}% restoration`, donor: faceSwapSource.path, strength: restorationStrength / 100, colorMatch: faceColorMatch / 100 });
 
@@ -657,6 +912,26 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     finally { setWorking(false); }
   };
 
+  /** Marks what watermark detection finds in the mask, to look over and change before removing it. */
+  const findWatermarks = async () => {
+    if (working || saving || !imageData) return;
+    const prompts = watermarkPrompts(watermarkText);
+    if (!prompts.length) { setMessage("Write what to look for, such as watermark."); return; }
+    setWorking(true); setCropMode(false); setCompare(false); setShowOriginal(false); setSelectingFace(false);
+    setMessage("Looking for watermarks…");
+    try {
+      const result = await imageAction("watermark", imageData, { mode: "detect", prompts, maxPercent: watermarkMaxPercent, model: model.id }) as ActionResult & { found: number; accepted: number };
+      pushMaskUndo();
+      await displaySelection(result.imageData);
+      if (brushTool !== "paint" && brushTool !== "erase") setBrushTool("paint");
+      const skipped = result.found - result.accepted;
+      setMessage(result.accepted
+        ? `Marked ${result.accepted} ${result.accepted === 1 ? "area" : "areas"}${skipped ? `, skipped ${skipped} larger than ${watermarkMaxPercent}%` : ""}. Paint or erase to correct it, then remove it with Space.`
+        : skipped ? `Found only areas larger than ${watermarkMaxPercent}% of the picture. Raise the largest size to mark them.` : "No watermark found. Try other words, such as logo or text.");
+    } catch (error) { setMessage(`Watermark detection failed: ${String(error)}`); }
+    finally { setWorking(false); }
+  };
+
   const refineSelection = async () => {
     if (working || !maskDirty) return;
     setWorking(true);
@@ -671,47 +946,28 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   const finishRetouch = async (points: number[][]) => {
     setWorking(true);
     try {
-      const result = await imageAction("retouch", imageData, { mode: brushTool, source: cloneSource, points, size: brushSize, hardness: brushSettings.hardness / 100, opacity: brushSettings.opacity / 100 });
+      const operation: Operation = { kind: "retouch", label: brushTool === "clone" ? "Clone stamp" : "Healing brush", mode: brushTool, source: cloneSource, points, size: brushSize, hardness: brushSettings.hardness / 100, opacity: brushSettings.opacity / 100 };
+      const result = await executeOperation(imageData, operation, originalImageData);
       const savedSource = cloneSource;
-      commitEdit(result.imageData, brushTool === "clone" ? "Clone stamp" : "Healing brush"); setCloneSource(savedSource);
+      commitEdit(result, operation.label, operation); setCloneSource(savedSource);
       setMessage("Retouch applied.");
     } catch (error) { clearMask(); setMessage(`Retouch failed: ${String(error)}`); }
     finally { setWorking(false); }
   };
 
-  const fitImage = useCallback(() => {
-    zoomRef.current = 1;
-    setZoom(1);
-    setPan({ x: 0, y: 0 });
-  }, []);
+  const fitImage = useCallback(() => glideTo(1, { x: 0, y: 0 }), [glideTo]);
 
   const transformImage = async (operation: typeof IMAGE_TRANSFORMS[number]["id"]) => {
     await performOperation({ kind: "transform", direction: operation, label: IMAGE_TRANSFORMS.find((item) => item.id === operation)!.label });
     fitImage();
   };
 
-  const actualSize = useCallback(() => {
-    const nextZoom = 1 / fitScale;
-    zoomRef.current = nextZoom;
-    setZoom(nextZoom);
-    setPan({ x: 0, y: 0 });
-  }, [fitScale]);
+  const actualSize = useCallback(() => glideTo(1 / fitScale, { x: 0, y: 0 }), [fitScale, glideTo]);
 
-  const zoomIn = useCallback(() => {
-    setZoom((value) => {
-      const nextZoom = Math.min(12, value * 1.2);
-      zoomRef.current = nextZoom;
-      return nextZoom;
-    });
-  }, []);
+  // Keys zoom around the middle of the view, from where a zoom already running is heading.
+  const zoomIn = useCallback(() => zoomAround(Math.min(12, targetZoom.current * 1.2)), [zoomAround, targetZoom]);
 
-  const zoomOut = useCallback(() => {
-    setZoom((value) => {
-      const nextZoom = Math.max(.2, value / 1.2);
-      zoomRef.current = nextZoom;
-      return nextZoom;
-    });
-  }, []);
+  const zoomOut = useCallback(() => zoomAround(Math.max(.2, targetZoom.current / 1.2)), [zoomAround, targetZoom]);
 
   const toggleCrop = () => {
     if (!cropMode) {
@@ -721,27 +977,73 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     }
     setCropMode(!cropMode); setSelectingFace(false); setCompare(false); setShowOriginal(false);
   };
-  const actionShortcuts = [
-    { key: "t", label: "Restore detail", run: () => { if (restoreStrength > 0) void performOperation(restoreOperation); } },
-    { key: "u", label: "Upscale image", run: () => void runImagePlugin(selectedUpscaler.plugin, upscaleModel, upscaleScale, selectedUpscaler.name) },
-    { key: "f", label: "Restore faces · GFPGAN", run: () => void runImagePlugin("gfpgan", "gfpgan", 1, "GFPGAN") },
-    { key: "r", label: "Replace selected / largest face", run: () => {
+  const cropUsable = cropRect[2] * dimensions.width >= 1 && cropRect[3] * dimensions.height >= 1;
+  const applyCrop = () => {
+    if (working || saving || !cropUsable) return;
+    void performOperation({ kind: "crop", label: `Crop / straighten ${cropAngle}°`, rect: cropRect, angle: cropAngle });
+  };
+  const cancelCrop = () => { setCropMode(false); setCropAngle(0); };
+  // What each shortcut does; the keys come from shortcuts.ts, where the user may change them.
+  const keys = useShortcutKeys();
+  const toolActions: Partial<Record<ShortcutId, () => void>> = {
+    "tool.restore": () => { if (restoreStrength > 0) void performOperation(restoreOperation); },
+    "tool.upscale": () => void runImagePlugin(selectedUpscaler.plugin, upscaleModel, upscaleScale, selectedUpscaler.name),
+    "tool.downscale": () => {
+      if (downscaleRatio >= 1) { setMessage(`The picture is already ${downscaleLongest} px or smaller.`); return; }
+      void performOperation(downscaleOperation);
+    },
+    "tool.gfpgan": () => void runImagePlugin("gfpgan", "gfpgan", 1, "GFPGAN"),
+    "tool.faceSwap": () => {
       if (!activeFaceSource) { setMessage("Choose a source photo in Face swap first."); return; }
       void runImagePlugin("face_swap", "", 1, "Face replacement + GFPGAN");
-    } },
-    { key: "b", label: "Remove background", run: () => void runImagePlugin("remove_bg", backgroundModel, 1, "Background removal") },
-    { key: "g", label: "Apply replacement background", run: () => {
+    },
+    "tool.removeBackground": () => void runImagePlugin("remove_bg", backgroundModel, 1, "Background removal"),
+    "tool.applyBackground": () => {
       if (backgroundType === "image" && !backgroundPath) { setMessage("Choose a background image first."); return; }
       void performOperation(backgroundOperation);
-    } },
-    { key: "d", label: "Detect / choose a face", run: () => void detectFaces() },
-    { key: "e", label: "Refine background edges", run: () => void performOperation({ kind: "refine_edges", label: "Refine background edges", ...edges }) },
-    { key: "c", label: "Toggle crop / straighten", run: toggleCrop },
-    { key: "h", label: "Flip horizontally", run: () => void transformImage("flip-horizontal") },
-    { key: "v", label: "Flip vertically", run: () => void transformImage("flip-vertical") },
-    { key: "[", label: "Rotate left", run: () => void transformImage("rotate-left") },
-    { key: "]", label: "Rotate right", run: () => void transformImage("rotate-right") },
-  ];
+    },
+    "tool.detectFaces": () => void detectFaces(),
+    "tool.refineEdges": () => void performOperation({ kind: "refine_edges", label: "Refine background edges", ...edges }),
+    "tool.crop": toggleCrop,
+    "tool.flipHorizontal": () => void transformImage("flip-horizontal"),
+    "tool.flipVertical": () => void transformImage("flip-vertical"),
+    "tool.rotateLeft": () => void transformImage("rotate-left"),
+    "tool.rotateRight": () => void transformImage("rotate-right"),
+  };
+  // Panels and the workspace's big actions: the panel opens, and the action runs once it is there.
+  const openPanel = (tab: DockTab) => setDockTab(openTab === tab ? "" : tab);
+  const askWorkspace = (tab: WorkspaceTab, name: WorkspaceCommand["name"]) => {
+    setDockTab(tab);
+    // Counted across editors, since the workspace remembers the last one it carried out.
+    workspaceCommands += 1;
+    setWorkspaceCommand({ name, count: workspaceCommands });
+  };
+  const editorActions: Partial<Record<ShortcutId, () => void>> = {
+    "panel.info": () => { if (image.path) openPanel("info"); },
+    "panel.annotations": () => openPanel("annotations"),
+    "panel.history": () => openPanel("history"),
+    "panel.workflows": () => openPanel("workflows"),
+    "panel.batch": () => openPanel("batch"),
+    "panel.export": () => openPanel("export"),
+    "panel.memory": () => openPanel("memory"),
+    "panel.strip": () => { if (total > 1) onStripToggle?.(); },
+    "workspace.runWorkflow": () => askWorkspace("workflows", "run-workflow"),
+    "workspace.export": () => askWorkspace("export", "export"),
+    "workspace.runBatch": () => askWorkspace("batch", "run-batch"),
+    "editor.save": () => void save(),
+    "editor.undo": () => undo(),
+    "editor.redo": () => redo(),
+    "editor.original": () => { setCompare(false); setSelectingFace(false); setCropMode(false); setShowOriginal((value) => !value); },
+    "editor.previous": () => { if (!working) safeNavigate(-1); },
+    "editor.next": () => { if (!working) safeNavigate(1); },
+    "editor.first": () => { if (!working) safeNavigate(-index); },
+    "editor.last": () => { if (!working) safeNavigate(total - index - 1); },
+    "editor.fit": fitImage,
+    "editor.actualSize": actualSize,
+    "editor.zoomIn": zoomIn,
+    "editor.zoomOut": zoomOut,
+  };
+  const keyOf = (id: ShortcutId) => keys[id] ? keyLabel(keys[id]) : "";
 
   useEffect(() => {
     const keyDown = (event: KeyboardEvent) => {
@@ -763,16 +1065,30 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       const textEntry = target instanceof HTMLTextAreaElement
         || (target instanceof HTMLInputElement && !["range", "checkbox", "radio", "color", "button"].includes(target.type))
         || (target instanceof HTMLElement && target.isContentEditable);
-      if (!textEntry && event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
-        const action = actionShortcuts.find((item) => item.key === event.key.toLowerCase());
-        if (action) {
-          event.preventDefault();
-          if (!event.repeat && !working && !saving && !choosingFace && imageData && !drawing.current && !panning.current && !cropStart.current) action.run();
-          return;
-        }
+      const combo = comboOf(event);
+      const shortcut = textEntry ? undefined : shortcutFor(keys, combo);
+      // A tool runs with a key held down or not, but never over one already running or a stroke in progress.
+      if (shortcut && toolActions[shortcut]) {
+        event.preventDefault();
+        if (!event.repeat && !working && !saving && !choosingFace && imageData && !drawing.current && !panning.current && !cropStart.current && !cropDrag.current) toolActions[shortcut]!();
+        return;
       }
       const typing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || textEntry;
-      if (typing || drawing.current || panning.current || cropStart.current) return;
+      if (drawing.current || panning.current || cropStart.current || cropDrag.current) return;
+      // While cropping, Enter applies the crop and Esc leaves it.
+      if (cropMode && !textEntry && (event.key === "Enter" || event.key === "Escape")) {
+        event.preventDefault();
+        if (event.key === "Escape") cancelCrop();
+        else if (!event.repeat) applyCrop();
+        return;
+      }
+      // In a list or a slider only keys with a modifier count, so choosing an option by letter still works.
+      if (shortcut && editorActions[shortcut] && (!typing || /^(Ctrl|Alt|Meta)\+/.test(combo))) {
+        event.preventDefault();
+        if (!event.repeat || shortcut.startsWith("editor.zoom")) editorActions[shortcut]!();
+        return;
+      }
+      if (typing) return;
       if (event.code === "Space") {
         if (event.repeat) return;
         spaceDown.current = true;
@@ -780,57 +1096,19 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
         spaceUsedForPan.current = false;
         event.preventDefault();
       }
+      // The keys that always mean the same thing.
+      if (event.key === "Escape" && (annotating || notePending)) {
+        event.preventDefault();
+        noteStart.current = null;
+        setNoteDraft(null);
+        setNotePending(false);
+        setAnnotating(false);
+        return;
+      }
       if (event.key === "Escape") safeExit();
-      const plainKey = !event.ctrlKey && !event.metaKey && !event.altKey;
-      if (plainKey && event.key.toLowerCase() === "o") {
-        event.preventDefault();
-        setCompare(false); setSelectingFace(false); setCropMode(false);
-        setShowOriginal((value) => !value);
-      }
-      if ((event.key === "ArrowLeft" || (plainKey && event.key.toLowerCase() === "a")) && !working) {
-        event.preventDefault();
-        safeNavigate(-1);
-      }
-      if ((event.key === "ArrowRight" || (plainKey && event.key.toLowerCase() === "d")) && !working) {
-        event.preventDefault();
-        safeNavigate(1);
-      }
-      if (plainKey && event.key === "Home" && !working) {
-        event.preventDefault();
-        safeNavigate(-index);
-      }
-      if (plainKey && event.key === "End" && !working) {
-        event.preventDefault();
-        safeNavigate(total - index - 1);
-      }
-      if (event.code === "NumpadMultiply") {
-        event.preventDefault();
-        fitImage();
-      }
-      if (event.code === "NumpadDivide") {
-        event.preventDefault();
-        actualSize();
-      }
-      if (event.code === "NumpadAdd") {
-        event.preventDefault();
-        zoomIn();
-      }
-      if (event.code === "NumpadSubtract") {
-        event.preventDefault();
-        zoomOut();
-      }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
-        event.preventDefault();
-        void save();
-      }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
-        event.preventDefault();
-        event.shiftKey ? redo() : undo();
-      }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") {
-        event.preventDefault();
-        redo();
-      }
+      if (event.key === "ArrowLeft" && !working) { event.preventDefault(); safeNavigate(-1); }
+      if (event.key === "ArrowRight" && !working) { event.preventDefault(); safeNavigate(1); }
+      if (combo === "Ctrl+Shift+Z" || combo === "Meta+Shift+Z") { event.preventDefault(); redo(); }
     };
     const keyUp = (event: KeyboardEvent) => {
       if (pendingLeave) return;
@@ -856,7 +1134,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       window.removeEventListener("keyup", keyUp);
       window.removeEventListener("blur", blur);
     };
-  }, [actualSize, fitImage, imageData, index, maskDirty, model, pendingLeave, prompt, redo, resolvePendingLeave, safeExit, safeNavigate, save, total, undo, working, saving, cropMode, selectingFace, compare, showOriginal, zoomIn, zoomOut, actionShortcuts, onReplaceCancel]);
+  }, [actualSize, fitImage, imageData, index, maskDirty, model, pendingLeave, prompt, redo, resolvePendingLeave, safeExit, safeNavigate, save, total, undo, working, saving, cropMode, selectingFace, compare, showOriginal, zoomIn, zoomOut, toolActions, editorActions, keys, onReplaceCancel, annotating, notePending, cropRect, cropAngle]);
 
   const canvasPoint = (event: { clientX: number; clientY: number }): Point | null => {
     const bounds = getViewportBounds();
@@ -925,7 +1203,19 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     if (!cropMode && (point.x < 0 || point.y < 0 || point.x >= dimensions.width || point.y >= dimensions.height)) return;
     point.x = Math.max(0, Math.min(dimensions.width - 1, point.x)); point.y = Math.max(0, Math.min(dimensions.height - 1, point.y));
     if (cropMode) {
+      const handle = event.target instanceof Element ? event.target.closest<HTMLElement>("[data-crop-handle]")?.dataset.cropHandle : undefined;
+      if (handle) {
+        cropDrag.current = { handle, start: { x: point.x / dimensions.width, y: point.y / dimensions.height }, rect: cropRect };
+        return;
+      }
       cropStart.current = { x: Math.max(0, Math.min(1, point.x / dimensions.width)), y: Math.max(0, Math.min(1, point.y / dimensions.height)) };
+      return;
+    }
+    if (annotating) {
+      noteStart.current = { x: point.x / dimensions.width, y: point.y / dimensions.height };
+      setNotePending(false);
+      setNoteText("");
+      setNoteDraft({ ...noteStart.current, width: 0, height: 0 });
       return;
     }
     if (brushTool === "smart") { void smartSelect(point, event.altKey); return; }
@@ -946,6 +1236,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   const pointerMove = (event: React.PointerEvent) => {
     if (!drawing.current && !panning.current && !isPaintingSurface(event)) {
       hideCursor();
+      if (pointedNote) setPointedNote(null);
       return;
     }
     if (!panning.current && !spaceDown.current) moveCursor(event.clientX, event.clientY);
@@ -955,6 +1246,32 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       const dy = event.clientY - lastPointer.current.y;
       setPan((value) => ({ x: value.x + dx, y: value.y + dy }));
       lastPointer.current = { x: event.clientX, y: event.clientY };
+      return;
+    }
+    if (noteStart.current) {
+      const point = canvasPoint(event);
+      if (!point) return;
+      const start = noteStart.current;
+      const x = Math.max(0, Math.min(1, point.x / dimensions.width));
+      const y = Math.max(0, Math.min(1, point.y / dimensions.height));
+      setNoteDraft({ x: Math.min(x, start.x), y: Math.min(y, start.y), width: Math.abs(x - start.x), height: Math.abs(y - start.y) });
+      return;
+    }
+    if (annotationsVisible && annotations.length && !drawing.current) {
+      const point = canvasPoint(event);
+      const x = point ? point.x / dimensions.width : -1, y = point ? point.y / dimensions.height : -1;
+      // The smallest box under the pointer wins, so a note inside a larger one can still be read.
+      const under = annotations
+        .filter((note) => x >= note.x && x <= note.x + note.width && y >= note.y && y <= note.y + note.height)
+        .sort((a, b) => a.width * a.height - b.width * b.height)[0];
+      if ((under?.id ?? null) !== pointedNote) setPointedNote(under?.id ?? null);
+    }
+    if (cropMode && cropDrag.current) {
+      const point = canvasPoint(event);
+      if (!point) return;
+      const { handle, start, rect } = cropDrag.current;
+      setCropRect(dragCrop(handle, rect, point.x / dimensions.width - start.x, point.y / dimensions.height - start.y,
+        cropRatio ? cropRatio * dimensions.height / dimensions.width : 0));
       return;
     }
     if (cropMode && cropStart.current) {
@@ -986,6 +1303,16 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   const pointerUp = (event: React.PointerEvent) => {
     if (drawing.current && event.type === "pointerup") pointerMove(event);
     cropStart.current = null;
+    cropDrag.current = null;
+    if (noteStart.current) {
+      noteStart.current = null;
+      // A click, or a box too small to find again, is not a note.
+      setNoteDraft((draft) => {
+        const big = !!draft && draft.width * dimensions.width >= 6 && draft.height * dimensions.height >= 6 && event.type === "pointerup";
+        setNotePending(big);
+        return big ? draft : null;
+      });
+    }
     const completedSnapshot = strokeSnapshot.current;
     strokeSnapshot.current = null;
     if (completedSnapshot) setMaskUndo((items) => appendMaskHistory(items, completedSnapshot));
@@ -1008,30 +1335,287 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     if (!isPaintingSurface(event)) return;
     event.preventDefault();
     if (!event.ctrlKey && !event.metaKey) {
-      const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
-      const currentZoom = zoomRef.current;
-      const nextZoom = Math.min(12, Math.max(0.2, currentZoom * factor));
-      const ratio = nextZoom / currentZoom;
+      // A wheel notch is one step; a touchpad's small scrolls zoom in proportion, so they stay smooth too.
+      const pixels = event.deltaMode === 1 ? event.deltaY * 33 : event.deltaMode === 2 ? event.deltaY * 400 : event.deltaY;
+      const factor = Math.abs(pixels) >= 50 ? (pixels < 0 ? 1.12 : 1 / 1.12) : Math.exp(-pixels * .0023);
+      const nextZoom = Math.min(12, Math.max(0.2, targetZoom.current * factor));
       const viewport = getViewportBounds();
-      if (viewport && ratio !== 1) {
-        const anchorX = event.clientX - viewport.left - viewport.width / 2;
-        const anchorY = event.clientY - viewport.top - viewport.height / 2;
-        setPan((value) => ({
-          x: anchorX - ratio * (anchorX - value.x),
-          y: anchorY - ratio * (anchorY - value.y),
-        }));
-      }
-      zoomRef.current = nextZoom;
-      setZoom(nextZoom);
+      if (!viewport || nextZoom === targetZoom.current) return;
+      zoomAround(nextZoom, { x: event.clientX - viewport.left - viewport.width / 2, y: event.clientY - viewport.top - viewport.height / 2 });
     } else {
       const direction = event.deltaY < 0 ? 1 : -1;
       onBrushSizeChange((value) => Math.min(500, Math.max(3, value + direction * Math.max(2, value * 0.08))));
     }
   };
 
-  // Pictures of Immich-compatible stores get the Immich panel, which takes turns with the workspace drawer.
-  const immichStore = image.path ? immichStores?.find((store) => image.path.startsWith(`${store.path.replace(/\/+$/, "")}/`)) : undefined;
-  const immichVisible = !!immichStore && immichOpen && !workspaceOpen;
+  // Pictures of Immich-compatible stores also get the Info panel, which reads their record in Immich.
+  const immichStore = image.path ? immichStores?.find((store) => store.id === image.storeId || image.path.startsWith(`${store.path.replace(/\/+$/, "")}/`)) : undefined;
+  // Every saved picture has an Info panel: Immich's record in a compatible store, ours everywhere else.
+  const dockTabs = DOCK_TABS.filter((entry) => entry.id !== "info" || image.path);
+  const openTab = dockTabs.some((entry) => entry.id === dockTab) ? dockTab : "";
+
+  const saveNote = async () => {
+    const draft = noteDraft;
+    const text = noteText.trim();
+    if (!draft || !text || !image.path) return;
+    try {
+      const note = await invoke<Annotation>("annotation_create", { path: image.path, ...draft, text });
+      setAnnotations((current) => [...current, note]);
+      setNoteDraft(null);
+      setNotePending(false);
+      setNoteText("");
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+  const editNote = async (id: string, text: string) => {
+    try {
+      await invoke("annotation_update", { id, text });
+      setAnnotations((current) => current.map((note) => (note.id === id ? { ...note, text: text.trim() } : note)));
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+  const deleteNote = async (id: string) => {
+    try {
+      await invoke("annotation_delete", { id });
+      setAnnotations((current) => current.filter((note) => note.id !== id));
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+  // Drawing a note only makes sense while its panel is open.
+  useEffect(() => {
+    if (openTab === "annotations") return;
+    setAnnotating(false);
+    noteStart.current = null;
+    setNoteDraft(null);
+    setNotePending(false);
+    setListedNote(null);
+  }, [openTab]);
+
+  // The rail opens a tool wherever it sits, and dragging a heading or a rail button reorders them.
+  const [toolOrder, setToolOrder] = usePreference<string[]>("inpaint.toolOrder", []);
+  const [opened, setOpened] = useState({ id: "", count: 0 });
+  const openSignal = (id: string) => (opened.id === id ? opened.count : 0);
+  const sectionIds = useRef<string[]>([]);
+  const moveSection = useCallback((moved: string, before: string) => {
+    const ids = sectionIds.current;
+    if (!ids.includes(moved) || !ids.includes(before)) return;
+    const next = ids.filter((id) => id !== moved);
+    next.splice(next.indexOf(before), 0, moved);
+    setToolOrder(next);
+  }, [setToolOrder]);
+  const showSection = (id: string) => {
+    setOpened((current) => ({ id, count: current.id === id ? current.count + 1 : 1 }));
+    // The section opens on the next render, so the scroll waits for it to take its height.
+    requestAnimationFrame(() => requestAnimationFrame(() => document.getElementById(`tool-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" })));
+  };
+
+  // The tools of the left panel: the rail lists them, and their headings drag into another order.
+  const sectionEntries: SectionEntry[] = [
+    { id: "comparison", title: "Comparison", icon: Eye, node: (
+            <ToolSection id="comparison" title="Comparison" icon={Eye} openSignal={openSignal("comparison")} onMove={moveSection}>
+              <button className={`plugin-run ${compare ? "active" : ""}`} disabled={working || saving} onClick={() => { setCompare(!compare); setShowOriginal(false); setCropMode(false); setSelectingFace(false); }}>Before / after slider</button>
+              {compare && <><Select aria-label="Compare against" value={compareWith} onChange={(e) => setCompareWith(e.target.value)}><option value="previous">Before the current step</option><option value="original">Original image</option></Select><input aria-label="Comparison position" type="range" min="0" max="100" value={divider} onChange={(e) => setDivider(+e.target.value)} /><div className="plugin-description">Before on the left, after on the right. Zoom and pan are linked. Before fits the current frame.</div></>}
+            </ToolSection>
+    ) },
+    ...advancedSections({ openSignal, onMove: moveSection, busy: operationWorking || previewBusy || saving, tool: brushTool, onTool: (tool) => { setBrushTool(tool); setCropMode(false); setCompare(false); setShowOriginal(false); setSelectingFace(false); }, brush: brushSettings, setBrush: setBrushSettings, size: brushSize, setSize: onBrushSizeChange, maskDirty: maskDirty, refineMask: () => void refineSelection(), resetPoints: () => setSmartPoints([]), pointCount: smartPoints.length, sourceSet: cloneSource !== null, adjustmentActive: adjustmentActive, adjustments: adjustments, onAdjust: setAdjustments, onStartAdjust: () => { setAdjustmentActive(true); setCompare(false); setCropMode(false); setShowOriginal(false); setSelectingFace(false); }, onApplyAdjust: () => void applyColorAdjustments(), onCancelAdjust: () => { setAdjustmentActive(false); setColorPreview(""); }, edges: edges, setEdges: setEdges, onEdges: () => void performOperation({ kind: "refine_edges", label: "Refine background edges", ...edges }), extension: extension, setExtension: setExtension, onExtend: () => void performOperation({ kind: "outpaint", label: "Extend canvas", ...extension }), width: dimensions.width, height: dimensions.height }),
+    ...(cropMode ? [{ id: "crop", title: "Crop and straighten", icon: Crop, node: (
+            <ToolSection id="crop" title="Crop and straighten" icon={Crop} openSignal={openSignal("crop")} onMove={moveSection}>
+              <Select aria-label="Crop aspect ratio" value={cropRatio} onChange={(e) => {
+                const ratio = +e.target.value; setCropRatio(ratio);
+                const normalized = ratio * dimensions.height / dimensions.width;
+                const w = ratio ? Math.min(1, normalized) : 1, h = ratio ? Math.min(1, 1 / normalized) : 1;
+                setCropRect([(1 - w) / 2, (1 - h) / 2, w, h]);
+              }}><option value="0">Free crop</option><option value="1">Square · 1:1</option><option value={4 / 3}>Landscape · 4:3</option><option value={3 / 2}>Photo · 3:2</option><option value={16 / 9}>Wide · 16:9</option><option value={3 / 4}>Portrait · 3:4</option><option value={2 / 3}>Portrait · 2:3</option><option value={9 / 16}>Tall · 9:16</option></Select>
+              <div className="denoise-control"><label htmlFor="straighten">Straighten <output>{cropAngle}°</output></label><input id="straighten" type="range" min="-15" max="15" step="0.1" value={cropAngle} onChange={(e) => setCropAngle(+e.target.value)} /></div>
+              <div className="plugin-description">Drag on the image to choose the crop, then drag its edges, corners or inside to adjust it. Enter applies it, Esc cancels. Rotated corners become transparent.</div>
+              <div className="plugin-figure">Output: {Math.round(cropRect[2] * dimensions.width)} × {Math.round(cropRect[3] * dimensions.height)} px</div>
+              <button className="plugin-run" disabled={working || saving || !cropUsable} onClick={applyCrop}>Apply crop <kbd>Enter</kbd></button>
+              <button className="plugin-run" disabled={working || saving} onClick={cancelCrop}>Cancel crop <kbd>Esc</kbd></button>
+            </ToolSection>
+    ) }] : []),
+    { id: "watermarks", title: "Watermarks", icon: Stamp, node: (
+            <ToolSection id="watermarks" title="Watermarks" icon={Stamp} openSignal={openSignal("watermarks")} onMove={moveSection}>
+              <div className="denoise-control"><label htmlFor="watermark-prompts">Look for</label>
+                <input id="watermark-prompts" className="prompt-input watermark-prompts" value={watermarkText} maxLength={400} disabled={operationWorking || saving}
+                  onChange={(event) => setWatermarkText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void findWatermarks(); }}
+                  placeholder={WATERMARK_PROMPTS.join(", ")} title="Phrases separated by commas; each one finds a mark" /></div>
+              <div className="denoise-control"><label htmlFor="watermark-size">Largest watermark <output>{watermarkMaxPercent}%</output></label>
+                <input id="watermark-size" type="range" min="1" max="60" value={watermarkMaxPercent} disabled={operationWorking || saving} onChange={(event) => setWatermarkMaxPercent(+event.target.value)} /></div>
+              <div className="plugin-description">Florence-2 marks what it finds (1.5 GB download on first use). Look it over, then remove it with {model.name}. Larger areas are usually the subject, so they are skipped.</div>
+              <button className="plugin-run" disabled={working || saving || !imageData} onClick={() => void findWatermarks()}>Find and mark</button>
+              <button className="plugin-run" disabled={working || saving || !imageData || !watermarkOperation.prompts.length} onClick={() => void performOperation(watermarkOperation)}>Find and remove at once</button>
+            </ToolSection>
+    ) },
+    { id: "restoration-strength", title: "Restoration strength", icon: Gauge, node: (
+            <ToolSection id="restoration-strength" title="Restoration strength" icon={Gauge} openSignal={openSignal("restoration-strength")} onMove={moveSection}>
+              <div className="denoise-control"><label htmlFor="restoration-strength">GFPGAN + face replacement <output>{restorationStrength}%</output></label><input id="restoration-strength" type="range" min="0" max="100" value={restorationStrength} disabled={operationWorking || saving} onChange={(e) => setRestorationStrength(+e.target.value)} /><div><span>Raw face</span><span>Restored face</span></div></div>
+              <div className="plugin-description">Shared by both tools. {restorationPreview ? "Adjusts the last result instantly without rerunning the model." : "Applied to the next restoration or replacement."}</div>
+            </ToolSection>
+    ) },
+    { id: "face-swap", title: "Face swap", icon: UserRound, node: (
+            <ToolSection id="face-swap" title="Face swap" icon={UserRound} openSignal={openSignal("face-swap")} onMove={moveSection}>
+              <div className="denoise-control"><label htmlFor="face-color-match">Match face color <output>{faceColorMatch}%</output></label><input id="face-color-match" type="range" min="0" max="100" step="5" value={faceColorMatch} disabled={working || saving} onChange={(e) => setFaceColorMatch(+e.target.value)} /><div className="plugin-description">Matches brightness and skin tone to the target photo on the next replacement.</div></div>
+              <div className="face-source-row">
+              <button
+                className="face-photo-picker"
+                onClick={() => void chooseFacePhoto()}
+                disabled={working || saving || choosingFace}
+                aria-label={activeFaceSource ? "Change face source photo" : "Select photo"}
+                title={activeFaceSource ? `Change source: ${activeFaceSource.path}` : "Select a photo with the face to use"}
+              >
+                {activeFaceSource && <img src={activeFaceSource.data} alt="Selected face source" />}
+                <span>{choosingFace ? "Loading…" : activeFaceSource ? "Change photo" : "Select photo"}</span>
+              </button>
+              {faceLibrary.length > 0 && <FaceLibrary paths={faceLibrary} activePath={activeFaceSource?.path} busy={working || saving || choosingFace}
+                onUse={chooseSavedFace} onApply={(path) => void replaceFace(path)} onRemove={removeSavedFace} onAdd={() => void addFacePhotos()} />}
+              </div>
+              {activeFaceSource && <button className="plugin-run" onClick={clearFacePhoto} disabled={working || saving || choosingFace}><X size={13} /> Clear photo</button>}
+              <button className="plugin-run" disabled={working || saving || !imageData} onClick={() => void detectFaces()}>Detect / choose a face{keyOf("tool.detectFaces") && <kbd className="action-shortcut">{keyOf("tool.detectFaces")}</kbd>}</button>
+              {faces.length > 0 && <><Select aria-label="Target face" value={selectedFace?.id ?? "largest"} disabled={working || saving} onChange={(e) => { setSelectedFace(faces.find((face) => face.id === +e.target.value) ?? null); setSelectingFace(true); }}><option value="largest">Largest face</option>{faces.map((face) => <option key={face.id} value={face.id}>Face {face.id + 1}{assignments[face.id] ? " · assigned" : ""}</option>)}</Select><button className="plugin-run" disabled={working || saving} onClick={() => setSelectingFace(!selectingFace)}>{selectingFace ? "Hide face boxes" : "Show face boxes"}</button></>}
+              <button
+                className="plugin-run"
+                onClick={() => void runImagePlugin("face_swap", "", 1, "Face replacement + GFPGAN")}
+                disabled={!activeFaceSource || !imageData || working || saving || choosingFace}
+              ><Play size={13} /> Replace{keyOf("tool.faceSwap") && <kbd className="action-shortcut">{keyOf("tool.faceSwap")}</kbd>}</button>
+              <div className="plugin-description">{selectedFace ? `Replaces face ${selectedFace.id + 1}` : "Replaces the largest face"}, then restores it with GFPGAN. Select each face to assign a different source.</div>
+              {Object.keys(assignments).length > 1 && <button className="plugin-run" disabled={working || saving} onClick={() => void runWorkflow(faces.filter((face) => assignments[face.id]).map((face) => ({ kind: "face", label: `Replace face ${face.id + 1}`, donor: assignments[face.id].path, strength: restorationStrength / 100, target: [face.box[0] + face.box[2] / 2, face.box[1] + face.box[3] / 2] })), "Replace assigned faces")}>Replace all assigned faces</button>}
+            </ToolSection>
+    ) },
+    { id: "face-restoration", title: "Face restoration", icon: ScanFace, node: (
+            <ToolSection id="face-restoration" title="Face restoration" icon={ScanFace} openSignal={openSignal("face-restoration")} onMove={moveSection}>
+              <div className="plugin-description">Restore facial detail with GFPGAN 1.4.</div>
+              <button
+                className="plugin-run"
+                onClick={() => void runImagePlugin("gfpgan", "gfpgan", 1, "GFPGAN")}
+                disabled={working || saving}
+              ><Play size={13} /> Run GFPGAN{keyOf("tool.gfpgan") && <kbd className="action-shortcut">{keyOf("tool.gfpgan")}</kbd>}</button>
+            </ToolSection>
+    ) },
+    { id: "restore", title: "Restore detail", icon: Sparkles, node: (
+            <ToolSection id="restore" title="Restore detail" icon={Sparkles} openSignal={openSignal("restore")} onMove={moveSection}>
+              <Select aria-label="Restoration mode" value={restoreMode} onChange={(event) => setRestoreMode(event.target.value)} disabled={working || saving}>
+                {RESTORE_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
+              </Select>
+              <div className="plugin-description">{selectedRestore.description}</div>
+              <div className="denoise-control"><label htmlFor="restore-strength">Restoration strength <output>{restoreStrength}%</output></label>
+                <input id="restore-strength" type="range" min="0" max="100" step="5" value={restoreStrength} disabled={working || saving} onChange={(event) => setRestoreStrength(+event.target.value)} />
+                <div><span>Original</span><span>Restored</span></div>
+              </div>
+              <div className="plugin-description">Keeps the picture's size and transparency. Strength applies on the next run. Downloads {selectedRestore.download} on first use.</div>
+              <div className="plugin-figure">{dimensions.width} × {dimensions.height} px</div>
+              <button className="plugin-run" disabled={!imageData || working || saving || restoreStrength === 0} onClick={() => void performOperation(restoreOperation)}><Play size={13} /> Restore detail{keyOf("tool.restore") && <kbd className="action-shortcut">{keyOf("tool.restore")}</kbd>}</button>
+            </ToolSection>
+    ) },
+    { id: "upscale", title: "Upscale", icon: Maximize2, node: (
+            <ToolSection id="upscale" title="Upscale" icon={Maximize2} openSignal={openSignal("upscale")} onMove={moveSection}>
+              <Select aria-label="Upscaling method" value={upscaleModel} onChange={(event) => setUpscaleModel(event.target.value)} disabled={working || saving}>
+                {UPSCALE_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
+              </Select>
+              <div className="plugin-description">{selectedUpscaler.description}</div>
+              {upscaleModel === "realesr-general-x4v3" && (
+                <div className="denoise-control">
+                  <label htmlFor="upscale-denoise">Denoising <output>{upscaleDenoise}%</output></label>
+                  <input
+                    id="upscale-denoise"
+                    type="range" min={0} max={100} step={5}
+                    value={upscaleDenoise}
+                    onChange={(event) => setUpscaleDenoise(Number(event.target.value))}
+                    disabled={working || saving}
+                  />
+                  <div><span>Keep texture</span><span>Remove noise</span></div>
+                </div>
+              )}
+              <Select aria-label="Upscale output factor" value={upscaleScale} onChange={(event) => setUpscaleScale(Number(event.target.value))} disabled={working || saving}>
+                <option value={2}>Output scale · 2×</option>
+                <option value={3}>Output scale · 3×</option>
+                <option value={4}>Output scale · 4×</option>
+              </Select>
+              <button
+                className="plugin-run"
+                onClick={() => void runImagePlugin(selectedUpscaler.plugin, upscaleModel, upscaleScale, selectedUpscaler.name)}
+                disabled={!imageData || working || saving}
+              ><Play size={13} /> Upscale image{keyOf("tool.upscale") && <kbd className="action-shortcut">{keyOf("tool.upscale")}</kbd>}</button>
+            </ToolSection>
+    ) },
+    { id: "downscale", title: "Downscale", icon: Minimize2, node: (
+            <ToolSection id="downscale" title="Downscale" icon={Minimize2} openSignal={openSignal("downscale")} onMove={moveSection}>
+              <Select aria-label="Downscaling filter" value={downscaleFilter} disabled={working || saving} onChange={(event) => setDownscaleFilter(event.target.value as ResizeFilter)}>
+                {RESIZE_FILTERS.map((filter) => <option key={filter.id} value={filter.id}>{filter.name}</option>)}
+              </Select>
+              <div className="plugin-description">{downscaleFilterInfo.description} Plain resampling, no AI.</div>
+              <label className="downscale-size">Longest side
+                <input type="number" min={16} max={32768} step={1} value={downscaleLongest} disabled={working || saving}
+                  onChange={(event) => { const value = Math.round(Number(event.target.value)); if (value >= 16 && value <= 32768) setDownscaleLongest(value); }} />
+                <span>px</span>
+              </label>
+              <div className="downscale-presets">
+                {[0.5, 0.25].map((part) => {
+                  const value = Math.max(16, Math.round(Math.max(dimensions.width, dimensions.height) * part));
+                  return <button key={part} type="button" disabled={working || saving} onClick={() => setDownscaleLongest(value)}>{part * 100}%</button>;
+                })}
+                {[3840, 2560, 1920, 1280].map((value) => <button key={value} type="button" className={downscaleLongest === value ? "active" : ""}
+                  disabled={working || saving} onClick={() => setDownscaleLongest(value)}>{value}</button>)}
+              </div>
+              <div className="plugin-figure">{downscaleRatio < 1
+                ? `${dimensions.width} × ${dimensions.height} → ${downscaled.width} × ${downscaled.height} px`
+                : `Already ${dimensions.width} × ${dimensions.height} px`}</div>
+              <button className="plugin-run" disabled={!imageData || working || saving || downscaleRatio >= 1} onClick={() => void performOperation(downscaleOperation)}>
+                <Play size={13} /> Downscale{keyOf("tool.downscale") && <kbd className="action-shortcut">{keyOf("tool.downscale")}</kbd>}
+              </button>
+            </ToolSection>
+    ) },
+    { id: "remove-background", title: "Remove background", icon: ImageOff, node: (
+            <ToolSection id="remove-background" title="Remove background" icon={ImageOff} openSignal={openSignal("remove-background")} onMove={moveSection}>
+              <Select value={backgroundModel} onChange={(event) => setBackgroundModel(event.target.value)}>
+                <option value="briaai/RMBG-1.4">BRIA RMBG 1.4 · No login</option>
+                <option value="briaai/RMBG-2.0">BRIA RMBG 2.0 · Requires access</option>
+                <option value="u2net">U²-Net · General</option>
+                <option value="u2net_human_seg">U²-Net · People</option>
+              </Select>
+              {backgroundModel === "briaai/RMBG-2.0" && <>
+                <div className="hf-token-links">
+                  {hfTokenSaved && <small>Access token saved</small>}
+                  <button className="text-link" disabled={working || saving || hfTokenBusy} onClick={() => { setHfAccessOpen(!hfAccessOpen); setConfirmTokenRemoval(false); }}>{hfAccessOpen ? "Close access settings" : hfTokenSaved ? "Change token" : "Set up model access"}</button>
+                  {hfTokenSaved && !confirmTokenRemoval && <button className="text-link token-remove" disabled={working || saving || hfTokenBusy} onClick={() => setConfirmTokenRemoval(true)}>Remove saved token</button>}
+                  {confirmTokenRemoval && <div className="token-confirm"><small>Remove the saved token?</small><button className="text-link" disabled={working || saving || hfTokenBusy} onClick={() => void saveHfToken(true)}>Yes, remove</button><button className="text-link" disabled={hfTokenBusy} onClick={() => setConfirmTokenRemoval(false)}>Cancel</button></div>}
+                </div>
+                {hfAccessOpen && <div className="hf-access">
+                  <div className="plugin-description">BRIA 2.0 is gated. Your Hugging Face account must have access before the token can download it.</div>
+                  <button className="plugin-run" onClick={() => void invoke("open_model_access", { tokens: false }).catch((e) => setMessage(String(e)))}>1. Open model access page</button>
+                  <button className="plugin-run" onClick={() => void invoke("open_model_access", { tokens: true }).catch((e) => setMessage(String(e)))}>2. Create a read token</button>
+                  <input type="password" autoComplete="off" aria-label="Hugging Face read token" placeholder={hfTokenSaved ? "Enter a replacement token" : "hf_…"} value={hfToken} onChange={(e) => setHfToken(e.target.value)} disabled={working || saving || hfTokenBusy} />
+                  <button className="plugin-run" disabled={working || saving || hfTokenBusy || !hfToken.trim()} onClick={() => void saveHfToken()}>3. Save token</button>
+                  <div className="plugin-description">Stored locally with access restricted to your Linux user. Never included in workflows or exports.</div>
+                </div>}
+              </>}
+              <div className="plugin-description">Transparency requires PNG or WebP.</div>
+              <button
+                className="plugin-run"
+                onClick={() => void runImagePlugin("remove_bg", backgroundModel, 1, "Background removal")}
+                disabled={working || saving}
+              ><Play size={13} /> Remove background{keyOf("tool.removeBackground") && <kbd className="action-shortcut">{keyOf("tool.removeBackground")}</kbd>}</button>
+            
+              <BackgroundEdgeTools refineKey={keyOf("tool.refineEdges")} openSignal={openSignal} onMove={moveSection} busy={operationWorking || previewBusy || saving} adjustmentActive={adjustmentActive} edges={edges} setEdges={setEdges} onEdges={() => void performOperation({ kind: "refine_edges", label: "Refine background edges", ...edges })} />
+            </ToolSection>
+    ) },
+    { id: "replace-background", title: "Replace background", icon: ImagePlus, node: (
+            <ToolSection id="replace-background" title="Replace background" icon={ImagePlus} openSignal={openSignal("replace-background")} onMove={moveSection}>
+              <Select aria-label="Background replacement type" value={backgroundType} disabled={working || saving} onChange={(e) => setBackgroundType(e.target.value as typeof backgroundType)}><option value="color">Solid color</option><option value="image">Another image</option><option value="blur">Blur original background</option></Select>
+              {backgroundType === "color" && <input aria-label="Background color" type="color" value={backgroundColor} disabled={working || saving} onChange={(e) => setBackgroundColor(e.target.value)} />}
+              {backgroundType === "image" && <><button className="plugin-run" disabled={working || saving} onClick={async () => { try { const selected = await open({ title: "Choose background image", filters: [{ name: "Pictures", extensions: ["png", "jpg", "jpeg", "webp"] }] }); if (typeof selected === "string") setBackgroundPath(selected); } catch (error) { setMessage(String(error)); } }}>Choose background image</button><div className="plugin-description path-text">{backgroundPath || "No background selected"}</div></>}
+              {backgroundType === "blur" && <div className="denoise-control"><label htmlFor="background-blur">Blur <output>{backgroundBlur} px</output></label><input id="background-blur" type="range" min="1" max="100" value={backgroundBlur} disabled={working || saving} onChange={(e) => setBackgroundBlur(+e.target.value)} /></div>}
+              <label className="check-label"><input type="checkbox" checked={removeFirst} disabled={working || saving} onChange={(e) => setRemoveFirst(e.target.checked)} /> Remove background first</label>
+              <div className="plugin-description">Uses the selected removal model. Turn off removal if the image already has transparency.</div>
+              <button className="plugin-run" disabled={working || saving || (backgroundType === "image" && !backgroundPath)} onClick={() => void performOperation(backgroundOperation)}>Apply background{keyOf("tool.applyBackground") && <kbd className="action-shortcut">{keyOf("tool.applyBackground")}</kbd>}</button>
+            </ToolSection>
+    ) },
+  ];
+  const placed = (id: string) => { const at = toolOrder.indexOf(id); return at < 0 ? Number.MAX_SAFE_INTEGER : at; };
+  const ordered = [...sectionEntries].sort((a, b) => placed(a.id) - placed(b.id));
+  sectionIds.current = ordered.map((section) => section.id);
 
   return (
     <div className="editor-shell">
@@ -1125,18 +1709,17 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
           <button className="icon-button" onClick={fitImage} title="Fit and center (Numpad *)"><Scan size={17} /></button>
         </div>
         <div className="editor-actions">
-          {immichStore && <button className={`icon-button ${immichVisible ? "active" : ""}`} title="Immich: favorite, rating, tags and albums" aria-label="Immich panel" aria-pressed={immichVisible}
-            onClick={() => { if (immichVisible) { setImmichOpen(false); } else { setImmichOpen(true); setWorkspaceOpen(false); } }}><Tags size={18} /></button>}
-          <button className="icon-button" title="Edit history" aria-label="Edit history" onClick={() => { setWorkspaceTab("history"); setWorkspaceOpen(true); }}><History size={18} /></button>
-          <button className="icon-button" title="Workflows and batch processing" aria-label="Workflows and batch processing" onClick={() => { setWorkspaceTab("workflows"); setWorkspaceOpen(true); }}><Layers size={18} /></button>
-          <button className="icon-button" title="Export a copy" aria-label="Export a copy" onClick={() => { setWorkspaceTab("export"); setWorkspaceOpen(true); }}><Download size={18} /></button>
           {image.path && <button className="icon-button danger" title="Delete this picture" aria-label="Delete this picture" disabled={working || saving || deleting} onClick={() => void deletePicture()}><Trash2 size={18} /></button>}
           <button className="save-button" onClick={() => void save()} disabled={(!dirty && !!savePath) || saving || working}>
             {saving ? <LoaderCircle className="spin" size={17} /> : <Save size={17} />} Save
           </button>
           <button className="apply-button" onClick={() => void applyInpaint()} disabled={!maskDirty || working || saving || cropMode || selectingFace || compare || showOriginal}>
             {working ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}
-            {working ? "Working…" : <><span>Remove object</span><kbd>Space</kbd></>}
+            {/* Both labels stay in the button, so it keeps one width while it works. */}
+            <span className="apply-label">
+              <span className={working ? "apply-hidden" : ""}><span>Remove object</span><kbd>Space</kbd></span>
+              <span className={working ? "" : "apply-hidden"}>Working…</span>
+            </span>
           </button>
         </div>
       </header>
@@ -1144,6 +1727,8 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       <div className="editor-body">
         <aside
           className="plugin-toolbar"
+          ref={toolbar}
+          onScroll={(event) => { toolbarScroll = event.currentTarget.scrollTop; }}
           onPointerDown={(event) => event.stopPropagation()}
           onPointerMove={(event) => event.stopPropagation()}
           onWheel={(event) => event.stopPropagation()}
@@ -1158,162 +1743,22 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
             <span>{showOriginal ? "Show edited" : "Show original"}</span><kbd>O</kbd>
           </button>
 
-          <ToolSection id="comparison" title="Comparison" icon={Eye}>
-            <button className={`plugin-run ${compare ? "active" : ""}`} disabled={working || saving} onClick={() => { setCompare(!compare); setShowOriginal(false); setCropMode(false); setSelectingFace(false); }}>Before / after slider</button>
-            {compare && <><select aria-label="Compare against" value={compareWith} onChange={(e) => setCompareWith(e.target.value)}><option value="previous">Before the current step</option><option value="original">Original image</option></select><input aria-label="Comparison position" type="range" min="0" max="100" value={divider} onChange={(e) => setDivider(+e.target.value)} /><div className="plugin-description">Before on the left, after on the right. Zoom and pan are linked. Before fits the current frame.</div></>}
-          </ToolSection>
-
-          <AdvancedTools busy={operationWorking || previewBusy || saving} tool={brushTool} onTool={(tool) => { setBrushTool(tool); setCropMode(false); setCompare(false); setShowOriginal(false); setSelectingFace(false); }}
-            brush={brushSettings} setBrush={setBrushSettings} size={brushSize} setSize={onBrushSizeChange} maskDirty={maskDirty} refineMask={() => void refineSelection()} resetPoints={() => setSmartPoints([])} pointCount={smartPoints.length}
-            sourceSet={cloneSource !== null} adjustmentActive={adjustmentActive} adjustments={adjustments} onAdjust={setAdjustments}
-            onStartAdjust={() => { setAdjustmentActive(true); setCompare(false); setCropMode(false); setShowOriginal(false); setSelectingFace(false); }} onApplyAdjust={() => void applyColorAdjustments()} onCancelAdjust={() => { setAdjustmentActive(false); setColorPreview(""); }}
-            edges={edges} setEdges={setEdges} onEdges={() => void performOperation({ kind: "refine_edges", label: "Refine background edges", ...edges })}
-            extension={extension} setExtension={setExtension} onExtend={() => void performOperation({ kind: "outpaint", label: "Extend canvas", ...extension })} width={dimensions.width} height={dimensions.height} />
-
-          {cropMode && <ToolSection id="crop" title="Crop and straighten" icon={Crop}>
-            <select aria-label="Crop aspect ratio" value={cropRatio} onChange={(e) => {
-              const ratio = +e.target.value; setCropRatio(ratio);
-              const normalized = ratio * dimensions.height / dimensions.width;
-              const w = ratio ? Math.min(1, normalized) : 1, h = ratio ? Math.min(1, 1 / normalized) : 1;
-              setCropRect([(1 - w) / 2, (1 - h) / 2, w, h]);
-            }}><option value="0">Free crop</option><option value="1">Square · 1:1</option><option value={4 / 3}>Landscape · 4:3</option><option value={3 / 2}>Photo · 3:2</option><option value={16 / 9}>Wide · 16:9</option><option value={3 / 4}>Portrait · 3:4</option><option value={2 / 3}>Portrait · 2:3</option><option value={9 / 16}>Tall · 9:16</option></select>
-            <div className="denoise-control"><label htmlFor="straighten">Straighten <output>{cropAngle}°</output></label><input id="straighten" type="range" min="-15" max="15" step="0.1" value={cropAngle} onChange={(e) => setCropAngle(+e.target.value)} /></div>
-            <div className="plugin-description">Drag on the image to choose the crop. Output: {Math.round(cropRect[2] * dimensions.width)} × {Math.round(cropRect[3] * dimensions.height)} px. Rotated corners become transparent.</div>
-            <button className="plugin-run" disabled={working || saving || cropRect[2] * dimensions.width < 1 || cropRect[3] * dimensions.height < 1} onClick={() => void performOperation({ kind: "crop", label: `Crop / straighten ${cropAngle}°`, rect: cropRect, angle: cropAngle })}>Apply crop</button>
-            <button className="plugin-run" disabled={working || saving} onClick={() => { setCropMode(false); setCropAngle(0); }}>Cancel crop</button>
-          </ToolSection>}
-
-          <ToolSection id="restoration-strength" title="Restoration strength" icon={SlidersHorizontal}>
-            <div className="denoise-control"><label htmlFor="restoration-strength">GFPGAN + face replacement <output>{restorationStrength}%</output></label><input id="restoration-strength" type="range" min="0" max="100" value={restorationStrength} disabled={operationWorking || saving} onChange={(e) => setRestorationStrength(+e.target.value)} /><div><span>Raw face</span><span>Restored face</span></div></div>
-            <div className="plugin-description">Shared by both tools. {restorationPreview ? "Adjusts the last result instantly without rerunning the model." : "Applied to the next restoration or replacement."}</div>
-          </ToolSection>
-
-          <ToolSection id="face-swap" title="Face swap" icon={UserRound}>
-            <div className="denoise-control"><label htmlFor="face-color-match">Match face color <output>{faceColorMatch}%</output></label><input id="face-color-match" type="range" min="0" max="100" step="5" value={faceColorMatch} disabled={working || saving} onChange={(e) => setFaceColorMatch(+e.target.value)} /><div className="plugin-description">Matches brightness and skin tone to the target photo on the next replacement.</div></div>
-            <div className="face-source-row">
-            <button
-              className="face-photo-picker"
-              onClick={() => void chooseFacePhoto()}
-              disabled={working || saving || choosingFace}
-              aria-label={activeFaceSource ? "Change face source photo" : "Select photo"}
-              title={activeFaceSource ? `Change source: ${activeFaceSource.path}` : "Select a photo with the face to use"}
-            >
-              {activeFaceSource && <img src={activeFaceSource.data} alt="Selected face source" />}
-              <span>{choosingFace ? "Loading…" : activeFaceSource ? "Change photo" : "Select photo"}</span>
-            </button>
-            {faceLibrary.length > 0 && <FaceLibrary paths={faceLibrary} activePath={activeFaceSource?.path} busy={working || saving || choosingFace}
-              onUse={chooseSavedFace} onApply={(path) => void replaceFace(path)} onRemove={removeSavedFace} onAdd={() => void addFacePhotos()} />}
-            </div>
-            {activeFaceSource && <button className="plugin-run" onClick={clearFacePhoto} disabled={working || saving || choosingFace}><X size={13} /> Clear photo</button>}
-            <button className="plugin-run" disabled={working || saving || !imageData} onClick={() => void detectFaces()}>Detect / choose a face<kbd className="action-shortcut">Alt+D</kbd></button>
-            {faces.length > 0 && <><select aria-label="Target face" value={selectedFace?.id ?? "largest"} disabled={working || saving} onChange={(e) => { setSelectedFace(faces.find((face) => face.id === +e.target.value) ?? null); setSelectingFace(true); }}><option value="largest">Largest face</option>{faces.map((face) => <option key={face.id} value={face.id}>Face {face.id + 1}{assignments[face.id] ? " · assigned" : ""}</option>)}</select><button className="plugin-run" disabled={working || saving} onClick={() => setSelectingFace(!selectingFace)}>{selectingFace ? "Hide face boxes" : "Show face boxes"}</button></>}
-            <button
-              className="plugin-run"
-              onClick={() => void runImagePlugin("face_swap", "", 1, "Face replacement + GFPGAN")}
-              disabled={!activeFaceSource || !imageData || working || saving || choosingFace}
-            ><Play size={13} /> Replace<kbd className="action-shortcut">Alt+R</kbd></button>
-            <div className="plugin-description">{selectedFace ? `Replaces face ${selectedFace.id + 1}` : "Replaces the largest face"}, then restores it with GFPGAN. Select each face to assign a different source.</div>
-            {Object.keys(assignments).length > 1 && <button className="plugin-run" disabled={working || saving} onClick={() => void runWorkflow(faces.filter((face) => assignments[face.id]).map((face) => ({ kind: "face", label: `Replace face ${face.id + 1}`, donor: assignments[face.id].path, strength: restorationStrength / 100, target: [face.box[0] + face.box[2] / 2, face.box[1] + face.box[3] / 2] })), "Replace assigned faces")}>Replace all assigned faces</button>}
-          </ToolSection>
-
-          <ToolSection id="face-restoration" title="Face restoration" icon={ScanFace}>
-            <div className="plugin-description">Restore facial detail with GFPGAN 1.4.</div>
-            <button
-              className="plugin-run"
-              onClick={() => void runImagePlugin("gfpgan", "gfpgan", 1, "GFPGAN")}
-              disabled={working || saving}
-            ><Play size={13} /> Run GFPGAN<kbd className="action-shortcut">Alt+F</kbd></button>
-          </ToolSection>
-
-          <ToolSection id="restore" title="Restore detail" icon={Sparkles}>
-            <select aria-label="Restoration mode" value={restoreMode} onChange={(event) => setRestoreMode(event.target.value)} disabled={working || saving}>
-              {RESTORE_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
-            </select>
-            <div className="plugin-description">{selectedRestore.description}</div>
-            <div className="denoise-control"><label htmlFor="restore-strength">Restoration strength <output>{restoreStrength}%</output></label>
-              <input id="restore-strength" type="range" min="0" max="100" step="5" value={restoreStrength} disabled={working || saving} onChange={(event) => setRestoreStrength(+event.target.value)} />
-              <div><span>Original</span><span>Restored</span></div>
-            </div>
-            <div className="plugin-description">Keeps {dimensions.width} × {dimensions.height} px and transparency. Strength applies on the next run. Downloads {selectedRestore.download} on first use.</div>
-            <button className="plugin-run" disabled={!imageData || working || saving || restoreStrength === 0} onClick={() => void performOperation(restoreOperation)}><Play size={13} /> Restore detail<kbd className="action-shortcut">Alt+T</kbd></button>
-          </ToolSection>
-
-          <ToolSection id="upscale" title="Upscale" icon={Maximize2}>
-            <select aria-label="Upscaling method" value={upscaleModel} onChange={(event) => setUpscaleModel(event.target.value)} disabled={working || saving}>
-              {UPSCALE_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
-            </select>
-            <div className="plugin-description">{selectedUpscaler.description}</div>
-            {upscaleModel === "realesr-general-x4v3" && (
-              <div className="denoise-control">
-                <label htmlFor="upscale-denoise">Denoising <output>{upscaleDenoise}%</output></label>
-                <input
-                  id="upscale-denoise"
-                  type="range" min={0} max={100} step={5}
-                  value={upscaleDenoise}
-                  onChange={(event) => setUpscaleDenoise(Number(event.target.value))}
-                  disabled={working || saving}
-                />
-                <div><span>Keep texture</span><span>Remove noise</span></div>
-              </div>
-            )}
-            <select aria-label="Upscale output factor" value={upscaleScale} onChange={(event) => setUpscaleScale(Number(event.target.value))} disabled={working || saving}>
-              <option value={2}>Output scale · 2×</option>
-              <option value={3}>Output scale · 3×</option>
-              <option value={4}>Output scale · 4×</option>
-            </select>
-            <button
-              className="plugin-run"
-              onClick={() => void runImagePlugin(selectedUpscaler.plugin, upscaleModel, upscaleScale, selectedUpscaler.name)}
-              disabled={!imageData || working || saving}
-            ><Play size={13} /> Upscale image<kbd className="action-shortcut">Alt+U</kbd></button>
-          </ToolSection>
-
-          <ToolSection id="remove-background" title="Remove background" icon={ImageOff}>
-            <select value={backgroundModel} onChange={(event) => setBackgroundModel(event.target.value)}>
-              <option value="briaai/RMBG-1.4">BRIA RMBG 1.4 · No login</option>
-              <option value="briaai/RMBG-2.0">BRIA RMBG 2.0 · Requires access</option>
-              <option value="u2net">U²-Net · General</option>
-              <option value="u2net_human_seg">U²-Net · People</option>
-            </select>
-            {backgroundModel === "briaai/RMBG-2.0" && <>
-              <div className="hf-token-links">
-                {hfTokenSaved && <small>Access token saved</small>}
-                <button className="text-link" disabled={working || saving || hfTokenBusy} onClick={() => { setHfAccessOpen(!hfAccessOpen); setConfirmTokenRemoval(false); }}>{hfAccessOpen ? "Close access settings" : hfTokenSaved ? "Change token" : "Set up model access"}</button>
-                {hfTokenSaved && !confirmTokenRemoval && <button className="text-link token-remove" disabled={working || saving || hfTokenBusy} onClick={() => setConfirmTokenRemoval(true)}>Remove saved token</button>}
-                {confirmTokenRemoval && <div className="token-confirm"><small>Remove the saved token?</small><button className="text-link" disabled={working || saving || hfTokenBusy} onClick={() => void saveHfToken(true)}>Yes, remove</button><button className="text-link" disabled={hfTokenBusy} onClick={() => setConfirmTokenRemoval(false)}>Cancel</button></div>}
-              </div>
-              {hfAccessOpen && <div className="hf-access">
-                <div className="plugin-description">BRIA 2.0 is gated. Your Hugging Face account must have access before the token can download it.</div>
-                <button className="plugin-run" onClick={() => void invoke("open_model_access", { tokens: false }).catch((e) => setMessage(String(e)))}>1. Open model access page</button>
-                <button className="plugin-run" onClick={() => void invoke("open_model_access", { tokens: true }).catch((e) => setMessage(String(e)))}>2. Create a read token</button>
-                <input type="password" autoComplete="off" aria-label="Hugging Face read token" placeholder={hfTokenSaved ? "Enter a replacement token" : "hf_…"} value={hfToken} onChange={(e) => setHfToken(e.target.value)} disabled={working || saving || hfTokenBusy} />
-                <button className="plugin-run" disabled={working || saving || hfTokenBusy || !hfToken.trim()} onClick={() => void saveHfToken()}>3. Save token</button>
-                <div className="plugin-description">Stored locally with access restricted to your Linux user. Never included in workflows or exports.</div>
-              </div>}
-            </>}
-            <div className="plugin-description">Transparency requires PNG or WebP.</div>
-            <button
-              className="plugin-run"
-              onClick={() => void runImagePlugin("remove_bg", backgroundModel, 1, "Background removal")}
-              disabled={working || saving}
-            ><Play size={13} /> Remove background<kbd className="action-shortcut">Alt+B</kbd></button>
-          
-            <BackgroundEdgeTools busy={operationWorking || previewBusy || saving} adjustmentActive={adjustmentActive} edges={edges} setEdges={setEdges} onEdges={() => void performOperation({ kind: "refine_edges", label: "Refine background edges", ...edges })} />
-          </ToolSection>
-          <ToolSection id="replace-background" title="Replace background" icon={ImageOff}>
-            <select aria-label="Background replacement type" value={backgroundType} disabled={working || saving} onChange={(e) => setBackgroundType(e.target.value as typeof backgroundType)}><option value="color">Solid color</option><option value="image">Another image</option><option value="blur">Blur original background</option></select>
-            {backgroundType === "color" && <input aria-label="Background color" type="color" value={backgroundColor} disabled={working || saving} onChange={(e) => setBackgroundColor(e.target.value)} />}
-            {backgroundType === "image" && <><button className="plugin-run" disabled={working || saving} onClick={async () => { try { const selected = await open({ title: "Choose background image", filters: [{ name: "Pictures", extensions: ["png", "jpg", "jpeg", "webp"] }] }); if (typeof selected === "string") setBackgroundPath(selected); } catch (error) { setMessage(String(error)); } }}>Choose background image</button><div className="plugin-description path-text">{backgroundPath || "No background selected"}</div></>}
-            {backgroundType === "blur" && <div className="denoise-control"><label htmlFor="background-blur">Blur <output>{backgroundBlur} px</output></label><input id="background-blur" type="range" min="1" max="100" value={backgroundBlur} disabled={working || saving} onChange={(e) => setBackgroundBlur(+e.target.value)} /></div>}
-            <label className="check-label"><input type="checkbox" checked={removeFirst} disabled={working || saving} onChange={(e) => setRemoveFirst(e.target.checked)} /> Remove background first</label>
-            <div className="plugin-description">Uses the selected removal model. Turn off removal if the image already has transparency.</div>
-            <button className="plugin-run" disabled={working || saving || (backgroundType === "image" && !backgroundPath)} onClick={() => void performOperation(backgroundOperation)}>Apply background<kbd className="action-shortcut">Alt+G</kbd></button>
-          </ToolSection>
-          <button className="plugin-run" onClick={() => { setWorkspaceTab("memory"); setWorkspaceOpen(true); }}><Layers size={15} /> Loaded models / memory</button>
+          {ordered.map((section) => <Fragment key={section.id}>{section.node}</Fragment>)}
         </aside>
+        <nav className="tool-rail" aria-label="Tools">
+          {ordered.map(({ id, title, icon: Icon }) => (
+            <button key={id} title={title} aria-label={title} draggable
+              onClick={() => showSection(id)}
+              onDragStart={(event) => { event.dataTransfer.setData(SECTION_DRAG, id); event.dataTransfer.effectAllowed = "move"; }}
+              onDragOver={(event) => { if (event.dataTransfer.types.includes(SECTION_DRAG)) event.preventDefault(); }}
+              onDrop={(event) => { const moved = event.dataTransfer.getData(SECTION_DRAG); if (moved && moved !== id) { event.preventDefault(); moveSection(moved, id); } }}>
+              <Icon size={17} aria-hidden="true" />
+            </button>
+          ))}
+        </nav>
       <div
         ref={viewportRef}
-        className={`editor-viewport ${panning.current ? "panning" : ""} ${cropMode || selectingFace || compare ? "selection-mode" : ""}`}
+        className={`editor-viewport ${stripOpen && total > 1 ? "strip-open" : ""} ${panning.current ? "panning" : ""} ${cropMode || selectingFace || compare || annotating || pickingPoint ? "selection-mode" : ""}`}
         onPointerDown={pointerDown}
         onPointerMove={pointerMove}
         onPointerUp={pointerUp}
@@ -1323,7 +1768,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
         onWheel={wheel}
         onContextMenu={(event) => event.preventDefault()}
       >
-        {!imageData ? <div className="editor-loading"><span className="spinner" />Loading image</div> : (
+        {!imageData ? (slowLoad ? <div className="editor-loading"><span className="spinner" />Loading image</div> : null) : (
           <div
             ref={stageRef}
             className={`image-stage ${stageReady ? "" : "initializing"}`}
@@ -1333,7 +1778,9 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
               transform: `translate(-50%, -50%) translate(${panRef.current.x}px, ${panRef.current.y}px) scale(${fitScale * zoomRef.current})`,
             }}
           >
-            <div className="image-clip"><img src={imageData} style={cropMode ? { transform: `rotate(${cropAngle}deg)` } : undefined} onLoad={onImageLoad} draggable={false} alt={image.name} />{colorPreview && <img src={colorPreview} draggable={false} alt="Color adjustment preview" />}</div>
+            <div className="image-clip"><img src={imageData} style={cropMode ? { transform: `rotate(${cropAngle}deg)` } : undefined} onLoad={onImageLoad} draggable={false} alt={image.name} />{colorPreview && <img src={colorPreview} draggable={false} alt="Color adjustment preview" />}
+              {animation && !animationPaused && history.position === 0 && !maskDirty && !cropMode && !compare && !showOriginal && !colorPreview && !selectingFace
+                && <img className="animation-frame" src={`${convertFileSrc(image.path, "thumb")}?v=${image.size}-${image.modifiedMs}&original`} draggable={false} alt="" />}</div>
             {originalImageData && (
               <img
                 className={`original-image ${showOriginal ? "visible" : ""}`}
@@ -1350,15 +1797,42 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
             <canvas ref={maskRef} className={showOriginal || compare || cropMode || selectingFace || adjustmentActive ? "hidden-mask" : ""} />
             {cloneSource && (brushTool === "clone" || brushTool === "heal") && <span className="clone-source" style={{ left: `${cloneSource[0] * 100}%`, top: `${cloneSource[1] * 100}%`, fontSize: "calc(24px / var(--image-scale, 1))" }}>+</span>}
             {brushTool === "smart" && smartPoints.map((point, index) => <span key={index} className={`selection-point ${point[2] ? "include" : "exclude"}`} style={{ left: `${point[0] * 100}%`, top: `${point[1] * 100}%`, width: "calc(9px / var(--image-scale, 1))", height: "calc(9px / var(--image-scale, 1))", borderWidth: "calc(1px / var(--image-scale, 1))" }} />)}
-            {cropMode && <div className="crop-outline" style={{ left: `${cropRect[0] * 100}%`, top: `${cropRect[1] * 100}%`, width: `${cropRect[2] * 100}%`, height: `${cropRect[3] * 100}%`, borderWidth: "calc(1px / var(--image-scale, 1))" }}><i /><i /></div>}
+            {!cropMode && annotations.map((note) => {
+              const pointedHere = pointedNote === note.id || listedNote === note.id;
+              if (!annotationsVisible && listedNote !== note.id) return null;
+              return <div key={note.id} className={`annotation ${pointedHere ? "active" : ""}`}
+                style={{ left: `${note.x * 100}%`, top: `${note.y * 100}%`, width: `${note.width * 100}%`, height: `${note.height * 100}%`, borderWidth: "calc(1px / var(--image-scale, 1))" }}>
+                {pointedHere && <span style={{ fontSize: "calc(12px / var(--image-scale, 1))", padding: "calc(4px / var(--image-scale, 1)) calc(6px / var(--image-scale, 1))", borderRadius: "calc(4px / var(--image-scale, 1))" }}>{note.text}</span>}
+              </div>;
+            })}
+            {noteDraft && <div className="annotation drafting"
+              style={{ left: `${noteDraft.x * 100}%`, top: `${noteDraft.y * 100}%`, width: `${noteDraft.width * 100}%`, height: `${noteDraft.height * 100}%`, borderWidth: "calc(1px / var(--image-scale, 1))" }} />}
+            {noteDraft && notePending && <form className="annotation-editor" onPointerDown={(event) => event.stopPropagation()} onWheel={(event) => event.stopPropagation()}
+              style={{ left: `${noteDraft.x * 100}%`, top: `${(noteDraft.y + noteDraft.height) * 100}%`, width: "calc(260px / var(--image-scale, 1))", fontSize: "calc(13px / var(--image-scale, 1))", marginTop: "calc(6px / var(--image-scale, 1))", padding: "calc(6px / var(--image-scale, 1))", borderRadius: "calc(7px / var(--image-scale, 1))" }}
+              onSubmit={(event) => { event.preventDefault(); void saveNote(); }}>
+              <textarea autoFocus value={noteText} placeholder="Write the note" rows={2} maxLength={2000}
+                onChange={(event) => setNoteText(event.target.value)}
+                onKeyDown={(event) => {
+                  event.stopPropagation();
+                  if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void saveNote(); }
+                  else if (event.key === "Escape") { event.preventDefault(); setNoteDraft(null); setNotePending(false); }
+                }} />
+              <small>Enter saves · Shift+Enter adds a line · Esc cancels</small>
+            </form>}
+            {cropMode && <div className="crop-outline" style={{ left: `${cropRect[0] * 100}%`, top: `${cropRect[1] * 100}%`, width: `${cropRect[2] * 100}%`, height: `${cropRect[3] * 100}%`, borderWidth: "calc(1px / var(--image-scale, 1))" }}><i /><i />
+              <span className="crop-move" data-crop-handle="move" />
+              {CROP_HANDLES.map((handle) => <span key={handle} className={`crop-handle ${handle}`} data-crop-handle={handle} />)}
+            </div>}
             {selectingFace && faces.map((face) => <button key={face.id} className={`face-box ${selectedFace?.id === face.id ? "selected" : ""}`} style={{ left: `${face.box[0] * 100}%`, top: `${face.box[1] * 100}%`, width: `${face.box[2] * 100}%`, height: `${face.box[3] * 100}%`, borderWidth: "calc(2px / var(--image-scale, 1))" }} aria-label={`Select face ${face.id + 1}`} onPointerDown={(e) => e.stopPropagation()} onClick={() => { setSelectedFace(face); setMessage(`Face ${face.id + 1} selected. Choose a source photo or press Replace.`); }}><span style={{ fontSize: "calc(12px / var(--image-scale, 1))" }}>Face {face.id + 1}{assignments[face.id] ? " · assigned" : ""}</span></button>)}
           </div>
         )}
 
 
         <div ref={cursorRef} className="brush-cursor" aria-hidden="true" />
-        <button className="nav-button previous" onClick={() => safeNavigate(-1)} disabled={total < 2 || working || saving} title="Previous image (Left arrow)"><ArrowLeft size={21} /></button>
-        <button className="nav-button next" onClick={() => safeNavigate(1)} disabled={total < 2 || working || saving} title="Next image (Right arrow)"><ArrowRight size={21} /></button>
+        <button className={`nav-button previous ${total < 2 ? "gone" : ""}`} onClick={() => safeNavigate(-1)} disabled={total < 2 || working || saving} title="Previous image (Left arrow)"><ArrowLeft size={21} /></button>
+        <button className={`nav-button strip ${stripOpen ? "active" : ""} ${total < 2 ? "gone" : ""}`} onClick={() => onStripToggle?.()} disabled={total < 2}
+          aria-pressed={stripOpen} title={stripOpen ? "Hide the picture strip" : "Show the picture strip"}><LayoutGrid size={19} /></button>
+        <button className={`nav-button next ${total < 2 ? "gone" : ""}`} onClick={() => safeNavigate(1)} disabled={total < 2 || working || saving} title="Next image (Right arrow)"><ArrowRight size={21} /></button>
         <div className="shortcut-help">
           <button className="shortcut-help-button" aria-label="Show keyboard shortcuts">?</button>
           <div className="shortcut-tooltip" role="tooltip">
@@ -1369,25 +1843,43 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
             <div><kbd>Space + drag / Middle drag</kbd><span>Pan</span></div>
             <div><kbd>Shift + paint</kbd><span>Paint and remove</span></div>
             <div><kbd>Space</kbd><span>Remove masked object</span></div>
-            <div><kbd>Ctrl + Z / Ctrl + Shift + Z</kbd><span>Undo / redo</span></div>
-            <div><kbd>← / → or A / D</kbd><span>Previous / next image</span></div>
-            <div><kbd>Home / End</kbd><span>First / last image</span></div>
-            <div><kbd>Numpad * / Numpad /</kbd><span>Fit / actual size</span></div>
-            <div><kbd>Numpad + / Numpad −</kbd><span>Zoom in / out</span></div>
-            <div><kbd>Ctrl + S</kbd><span>Overwrite image</span></div>
-            <div><kbd>O</kbd><span>Toggle original / edited</span></div>
+            <div><kbd>← / →</kbd><span>Previous / next image</span></div>
             <div><kbd>Esc</kbd><span>Back to browser</span></div>
-            <strong>Actions · current tool settings</strong>
-            {actionShortcuts.map((action) => <div key={action.key}><kbd>Alt + {action.key.toUpperCase()}</kbd><span>{action.label}</span></div>)}
+            {SHORTCUTS.filter((shortcut) => keys[shortcut.id]).map((shortcut) => <div key={shortcut.id}><kbd>{keyLabel(keys[shortcut.id])}</kbd><span>{shortcut.label}</span></div>)}
+            <small>Change these in Settings · Shortcuts.</small>
             <div><kbd>Alt + click</kbd><span>Sample clone / healing source, or exclude smart selection</span></div>
           </div>
         </div>
+        {animation && imageData && <button className={`animation-badge ${history.position > 0 ? "edited" : ""}`}
+          onPointerDown={(event) => event.stopPropagation()}
+          disabled={history.position > 0}
+          onClick={() => setAnimationPaused((paused) => !paused)}
+          title={history.position > 0 ? (animation.editable ? `Edits are shown on the first frame. Save applies them to all ${animation.frames} frames.` : "This animation is too long to edit every frame, so Save keeps only the edited first frame, as a new picture.") : animationPaused ? "Play the animation" : "Pause the animation"}>
+          {history.position > 0 || animationPaused ? <Play size={13} /> : <Pause size={13} />}
+          <span>{history.position > 0 ? (animation.editable ? `Frame 1 of ${animation.frames} · Save edits every frame` : `Frame 1 of ${animation.frames} · Saved as a still`) : `GIF · ${animation.frames} frames`}</span>
+        </button>}
         {message && <div className={`toast ${message.includes("failed") ? "error" : ""}`}>{message}</div>}
       </div>
-        {workspaceOpen && <Workspace tab={workspaceTab} onTab={setWorkspaceTab} onClose={() => setWorkspaceOpen(false)}
-          data={imageData} name={image.name} dimensions={dimensions} history={history.entries} position={history.position}
-          onJump={jumpHistory} suggestions={suggestions} busy={working || saving} onBusy={setWorking} onMessage={setMessage} onRun={runWorkflow} />}
-        {immichVisible && immichStore && <ImmichPanel key={image.path} path={image.path} onClose={() => setImmichOpen(false)} />}
+        <div className="right-dock">
+          {/* The tabs stand on the panel's edge, so every panel is one click away and none hides another. */}
+          <nav className="dock-rail" aria-label="Side panels">
+            {dockTabs.map(({ id, label, icon: Icon }) => (
+              <button key={id} className={openTab === id ? "active" : ""} title={keyOf(`panel.${id}` as ShortcutId) ? `${label} (${keyOf(`panel.${id}` as ShortcutId)})` : label} aria-pressed={openTab === id}
+                onClick={() => setDockTab(openTab === id ? "" : id)}>
+                <Icon size={17} aria-hidden="true" /><span>{label}</span>
+              </button>
+            ))}
+          </nav>
+          {openTab === "info" && image.path && (immichStore
+            ? <ImmichPanel key={image.path} path={image.path} storeId={immichStore.id} onClose={() => setDockTab("")} />
+            : <PictureInfo key={image.path} path={image.path} onClose={() => setDockTab("")} />)}
+          {openTab === "annotations" && <AnnotationsPanel annotations={annotations} available={!!image.path} visible={annotationsVisible} drawing={annotating}
+            onVisible={setAnnotationsVisible} onDrawing={(on) => { setAnnotating(on); if (!on) { setNoteDraft(null); setNotePending(false); } }}
+            onHover={setListedNote} onEdit={(id, text) => void editNote(id, text)} onDelete={(id) => void deleteNote(id)} onClose={() => setDockTab("")} />}
+          {openTab && openTab !== "info" && openTab !== "annotations" && <Workspace tab={openTab} onClose={() => setDockTab("")} command={workspaceCommand}
+            data={imageData} name={image.name} dimensions={dimensions} history={history.entries} position={history.position}
+            onJump={jumpHistory} suggestions={suggestions} busy={working || saving} onBusy={setWorking} onMessage={setMessage} onRun={runWorkflow} />}
+        </div>
       </div>
       {pendingLeave && (
         <div className="leave-dialog-backdrop" role="presentation">

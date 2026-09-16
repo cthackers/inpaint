@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { Store } from "./types";
+import type { Album, Store } from "./types";
+import Select from "./Select";
 
 type DropboxSettings = {
   enabled: boolean;
@@ -12,6 +13,8 @@ type DropboxSettings = {
   margin: number;
   opacity: number;
   monitor: "left" | "middle" | "right";
+  /** The album each store's dropped pictures join, by store id. */
+  albums: Record<string, string>;
 };
 type DropboxStatus = { settings: DropboxSettings; hotkeys: boolean };
 
@@ -24,6 +27,21 @@ export default function DropboxTab({ stores }: { stores: Store[] }) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const saved = useRef<DropboxSettings | null>(null);
+  // The albums of the store chosen here, to pick the one dropped pictures join.
+  const [albums, setAlbums] = useState<Album[] | null>(null);
+  const [albumError, setAlbumError] = useState("");
+  const chosenStore = stores.find((item) => item.id === draft?.storeId);
+  useEffect(() => {
+    setAlbums(null);
+    setAlbumError("");
+    if (!chosenStore) return;
+    let current = true;
+    void invoke<Album[]>(chosenStore.immich ? "immich_albums" : "albums_list", { storeId: chosenStore.id })
+      // Immich's grouping albums are only parts of names and cannot hold pictures.
+      .then((list) => { if (current) setAlbums(list.filter((album) => !album.isVirtual)); })
+      .catch((error) => { if (current) setAlbumError(String(error)); });
+    return () => { current = false; };
+  }, [chosenStore?.id, chosenStore?.immich]);
   useEffect(() => {
     void invoke<DropboxStatus>("dropbox_status").then((value) => {
       saved.current = value.settings;
@@ -62,13 +80,26 @@ export default function DropboxTab({ stores }: { stores: Store[] }) {
     <small>A translucent area in a corner of the screen. Drop pictures on it from the browser, a file manager or any other program to save them into an image store.</small>
     <div className="workspace-form">
       <label className="check-label"><input type="checkbox" checked={draft.enabled} disabled={busy} onChange={(e) => update({ enabled: e.target.checked })} /> Show the drop box</label>
-      <label>Save into<select value={store ? draft.storeId : ""} disabled={busy || !stores.length} onChange={(e) => update({ storeId: e.target.value })}>
+      <label>Save into<Select value={store ? draft.storeId : ""} disabled={busy || !stores.length} onChange={(e) => update({ storeId: e.target.value })}>
         {!store && <option value="">{stores.length ? "Choose a store" : "Create an image store first"}</option>}
         {stores.map((item) => <option key={item.id} value={item.id}>{item.name}{item.immich ? " · Immich" : ""}</option>)}
-      </select></label>
+      </Select></label>
       <small>{store?.immich
         ? "Pictures are uploaded to Immich, which files them and skips pictures it already has."
         : "Pictures are saved as ab/cd/<SHA-1>.jpg, and a picture already in the store is skipped."}</small>
+      {store && <>
+        <label>Add to album<Select value={albums?.some((album) => album.id === draft.albums?.[store.id]) ? draft.albums[store.id] : ""}
+          disabled={busy || !albums} onChange={(e) => {
+            const next = { ...(draft.albums ?? {}) };
+            if (e.target.value) next[store.id] = e.target.value; else delete next[store.id];
+            update({ albums: next });
+          }}>
+          <option value="">{albums ? "No album" : albumError ? "Albums could not be read" : "Reading albums…"}</option>
+          {(albums ?? []).slice().sort((a, b) => (a.fullName || a.name).localeCompare(b.fullName || b.name, undefined, { sensitivity: "base" }))
+            .map((album) => <option key={album.id} value={album.id}>{album.fullName || album.name}</option>)}
+        </Select></label>
+        <small>{albumError || "Optional. Every picture dropped into this store joins the album, including one the store already had. Each store keeps its own choice."}</small>
+      </>}
 
       <label className="check-label"><input type="checkbox" checked={draft.pinned} disabled={busy} onChange={(e) => update({ pinned: e.target.checked })} /> Always visible</label>
       <small>{status.hotkeys
@@ -76,11 +107,11 @@ export default function DropboxTab({ stores }: { stores: Store[] }) {
         : "Showing it with Win+Ctrl needs an X11 session, so keep it always visible."} Right-click it to change the store.</small>
 
       <div className="form-row">
-        <label>Screen<select value={draft.monitor} disabled={busy} onChange={(e) => update({ monitor: e.target.value as DropboxSettings["monitor"] })}>
+        <label>Screen<Select value={draft.monitor} disabled={busy} onChange={(e) => update({ monitor: e.target.value as DropboxSettings["monitor"] })}>
           <option value="left">Left</option>
           <option value="middle">Middle</option>
           <option value="right">Right</option>
-        </select></label>
+        </Select></label>
         <label>Margin (px)<input type="number" min={0} max={2000} value={draft.margin} disabled={busy} onChange={(e) => update({ margin: number(e.target.value) })} /></label>
       </div>
       <div className="form-row">

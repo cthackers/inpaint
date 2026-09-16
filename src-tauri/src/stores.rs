@@ -34,6 +34,11 @@ pub struct Store {
     pub immich: bool,
     /// The store folder as Immich sees it, such as /data/upload/<user id>.
     pub immich_path: String,
+    /// The Immich this store belongs to, when it is not the one in Settings.
+    pub immich_url: String,
+    /// The API key for this store, when it is not the one in Settings.
+    pub immich_key: String,
+    pub hidden: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -59,21 +64,30 @@ pub struct StoresState {
     scanning: Mutex<HashSet<String>>,
 }
 
-const STORE_COLUMNS: &str = "id, name, path, immich, immich_path";
+const STORE_COLUMNS: &str = "id, name, path, immich, immich_path, immich_url, immich_key, hidden";
 
 fn read_store(row: &rusqlite::Row) -> rusqlite::Result<Store> {
-    Ok(Store { id: row.get(0)?, name: row.get(1)?, path: row.get(2)?, immich: row.get(3)?, immich_path: row.get(4)? })
+    Ok(Store {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        path: row.get(2)?,
+        immich: row.get(3)?,
+        immich_path: row.get(4)?,
+        immich_url: row.get(5)?,
+        immich_key: row.get(6)?,
+        hidden: row.get(7)?,
+    })
 }
 
 /// Adds a store to the registry at `position`; a store with the same id or folder is kept.
 pub(crate) fn insert(connection: &Connection, store: &Store, position: i64) -> rusqlite::Result<usize> {
     connection.execute(
-        "INSERT OR IGNORE INTO stores (id, position, name, path, immich, immich_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![store.id, position, store.name, store.path, store.immich, store.immich_path],
+        "INSERT OR IGNORE INTO stores (id, position, name, path, immich, immich_path, immich_url, immich_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![store.id, position, store.name, store.path, store.immich, store.immich_path, store.immich_url, store.immich_key],
     )
 }
 
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).expect("the system random number generator is unavailable");
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -88,16 +102,24 @@ pub fn find_store(id: &str) -> Result<Store, String> {
         .query_row(&format!("SELECT {STORE_COLUMNS} FROM stores WHERE id = ?1"), [id], read_store)
         .optional()
         .map_err(database_error)?
+        .filter(|store| !store.hidden || super::hidden::revealed())
         .ok_or_else(|| "This store no longer exists.".into())
 }
 
 /// Stores marked Immich compatible, for refreshing Immich after a save.
 pub fn immich_stores() -> Vec<Store> {
-    stores_list().into_iter().filter(|store| store.immich).collect()
+    all_stores().into_iter().filter(|store| store.immich).collect()
 }
 
+/// The stores that can be shown and chosen now.
 #[tauri::command]
 pub fn stores_list() -> Vec<Store> {
+    let revealed = super::hidden::revealed();
+    all_stores().into_iter().filter(|store| revealed || !store.hidden).collect()
+}
+
+/// Every store, for keeping indexes and Immich current whichever are shown.
+pub fn all_stores() -> Vec<Store> {
     let connection = db::settings_db();
     let stores = connection
         .prepare(&format!("SELECT {STORE_COLUMNS} FROM stores ORDER BY position"))
@@ -150,8 +172,16 @@ pub fn store_update(app: AppHandle, store: Store) -> Result<Store, String> {
     if store.immich && !immich_path.starts_with('/') {
         return Err("Enter the folder as Immich sees it, such as /data/upload/<user id>.".into());
     }
+    // Empty means this store uses the Immich in Settings.
+    let immich_url = store.immich_url.trim().trim_end_matches('/').trim_end_matches("/api").to_string();
+    if !immich_url.is_empty() && !(immich_url.starts_with("http://") || immich_url.starts_with("https://")) {
+        return Err("Enter this store's Immich address starting with http:// or https://.".into());
+    }
     let changed = db::settings_db()
-        .execute("UPDATE stores SET name = ?1, immich = ?2, immich_path = ?3 WHERE id = ?4", params![name, store.immich, immich_path, store.id])
+        .execute(
+            "UPDATE stores SET name = ?1, immich = ?2, immich_path = ?3, immich_url = ?4, immich_key = ?5 WHERE id = ?6",
+            params![name, store.immich, immich_path, immich_url, store.immich_key.trim(), store.id],
+        )
         .map_err(database_error)?;
     if changed == 0 {
         return Err("This store no longer exists.".into());
@@ -161,13 +191,36 @@ pub fn store_update(app: AppHandle, store: Store) -> Result<Store, String> {
     Ok(updated)
 }
 
-/// Forgets a store. Its folder and pictures stay on disk.
+#[tauri::command]
+pub fn store_set_hidden(app: AppHandle, id: String, hidden: bool) -> Result<Store, String> {
+    if !super::hidden::revealed() {
+        return Err("This store no longer exists.".into());
+    }
+    let changed = db::settings_db().execute("UPDATE stores SET hidden = ?1 WHERE id = ?2", params![hidden, id]).map_err(database_error)?;
+    if changed == 0 {
+        return Err("This store no longer exists.".into());
+    }
+    super::hidden::touch();
+    let store = find_store(&id)?;
+    super::dropbox::refresh(&app);
+    Ok(store)
+}
+
+/// Forgets a store with its albums. Its folder and pictures stay on disk.
 #[tauri::command]
 pub fn store_remove(app: AppHandle, id: String) -> Result<(), String> {
-    db::settings_db().execute("DELETE FROM stores WHERE id = ?1", [&id]).map_err(database_error)?;
+    let settings = db::settings_db();
+    settings.execute("DELETE FROM stores WHERE id = ?1", [&id]).map_err(database_error)?;
+    super::albums::forget_store(&settings, &id).map_err(database_error)?;
+    drop(settings);
     let cache = db::cache_db();
     let _ = cache.execute("DELETE FROM store_pictures WHERE store_id = ?1", [&id]);
     let _ = cache.execute("DELETE FROM store_scans WHERE store_id = ?1", [&id]);
+    let _ = cache.execute("DELETE FROM store_tag_index WHERE store_id = ?1", [&id]);
+    let _ = cache.execute("DELETE FROM store_tag_scans WHERE store_id = ?1", [&id]);
+    let _ = cache.execute("DELETE FROM store_album_index WHERE store_id = ?1", [&id]);
+    let _ = cache.execute("DELETE FROM store_album_scans WHERE store_id = ?1", [&id]);
+    let _ = cache.execute("DELETE FROM store_facts WHERE store_id = ?1", [&id]);
     drop(cache);
     super::dropbox::refresh(&app);
     Ok(())
@@ -177,10 +230,10 @@ pub fn store_remove(app: AppHandle, id: String) -> Result<(), String> {
 pub(crate) fn write_index(connection: &Connection, id: &str, contents: &StoreContents) -> rusqlite::Result<()> {
     connection.execute("DELETE FROM store_pictures WHERE store_id = ?1", [id])?;
     let mut insert = connection.prepare_cached(
-        "INSERT OR REPLACE INTO store_pictures (store_id, path, name, extension, size, modified_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR REPLACE INTO store_pictures (store_id, path, name, extension, size, modified_ms, added_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     for image in &contents.images {
-        insert.execute(params![id, image.path, image.name, image.extension, image.size as i64, image.modified_ms as i64])?;
+        insert.execute(params![id, image.path, image.name, image.extension, image.size as i64, image.modified_ms as i64, image.added_ms as i64])?;
     }
     let stats = &contents.stats;
     connection.execute(
@@ -200,7 +253,7 @@ pub(crate) fn read_index(connection: &Connection, id: &str) -> rusqlite::Result<
     else {
         return Ok(None);
     };
-    let mut statement = connection.prepare("SELECT name, path, extension, size, modified_ms FROM store_pictures WHERE store_id = ?1 ORDER BY modified_ms DESC, name")?;
+    let mut statement = connection.prepare("SELECT name, path, extension, size, modified_ms, added_ms FROM store_pictures WHERE store_id = ?1 ORDER BY modified_ms DESC, name")?;
     let images: Vec<ImageEntry> = statement
         .query_map([id], |row| {
             Ok(ImageEntry {
@@ -209,6 +262,8 @@ pub(crate) fn read_index(connection: &Connection, id: &str) -> rusqlite::Result<
                 extension: row.get(2)?,
                 size: row.get::<_, i64>(3)? as u64,
                 modified_ms: row.get::<_, i64>(4)? as u128,
+                // Indexes from before the column hold 0 until the next scan.
+                added_ms: match row.get::<_, i64>(5)? { 0 => row.get::<_, i64>(4)?, added => added } as u128,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -256,7 +311,7 @@ pub async fn store_scan(app: AppHandle, state: tauri::State<'_, StoresState>, id
 /// Adds or updates a picture in its store's index after it was saved or dropped, until the next scan.
 /// Pictures outside stores, outside the layout, or in stores never scanned are left alone.
 pub fn record_picture(path: &Path) {
-    let Some(store) = stores_list().into_iter().find(|store| path.starts_with(&store.path)) else { return };
+    let Some(store) = all_stores().into_iter().find(|store| path.starts_with(&store.path)) else { return };
     let Some(image) = super::image_entry(path) else { return };
     let relative: Vec<String> = path.strip_prefix(&store.path).map(|relative| relative.iter().map(|part| part.to_string_lossy().into_owned()).collect()).unwrap_or_default();
     let [first, second, file] = relative.as_slice() else { return };
@@ -264,20 +319,23 @@ pub fn record_picture(path: &Path) {
         return;
     }
     let result = db::cache_db().execute(
-        "INSERT OR REPLACE INTO store_pictures (store_id, path, name, extension, size, modified_ms)
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS (SELECT 1 FROM store_scans WHERE store_id = ?1)",
-        params![store.id, image.path, image.name, image.extension, image.size as i64, image.modified_ms as i64],
+        "INSERT OR REPLACE INTO store_pictures (store_id, path, name, extension, size, modified_ms, added_ms)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS (SELECT 1 FROM store_scans WHERE store_id = ?1)",
+        params![store.id, image.path, image.name, image.extension, image.size as i64, image.modified_ms as i64, image.added_ms as i64],
     );
     if let Err(error) = result {
         eprintln!("Cannot update the store index: {error}");
     }
 }
 
-/// Removes a deleted picture from every store index.
+/// Removes a deleted picture from every store index and from the albums holding it.
 pub fn forget_picture(path: &Path) {
-    if let Err(error) = db::cache_db().execute("DELETE FROM store_pictures WHERE path = ?1", [super::path_string(path)]) {
+    let path = super::path_string(path);
+    if let Err(error) = db::cache_db().execute("DELETE FROM store_pictures WHERE path = ?1", [&path]) {
         eprintln!("Cannot update the store index: {error}");
     }
+    super::albums::forget_picture(&path);
+    super::pictures::forget_picture(&path);
 }
 
 fn is_hex_pair(name: &str) -> bool {
@@ -291,6 +349,15 @@ fn layout_extension(first: &str, second: &str, file: &str) -> Option<String> {
         return None;
     }
     super::picture_extension(Path::new(&lower))
+}
+
+/// When the file was created, or its modification time where the file system does not say.
+pub fn added_ms(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or_else(|| modified_ms(metadata), |duration| duration.as_millis())
 }
 
 pub fn modified_ms(metadata: &fs::Metadata) -> u128 {
@@ -366,6 +433,7 @@ fn scan_top_folder(root: &Path, first: &str) -> (Vec<ImageEntry>, u64) {
                 extension,
                 size: metadata.len(),
                 modified_ms: modified_ms(&metadata),
+                added_ms: added_ms(&metadata),
             });
         }
     }

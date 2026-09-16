@@ -49,9 +49,35 @@ def edit_image(input_path, output_path, options, reference_path=None):
         else:
             raise ValueError("Unsupported background type.")
         result = Image.alpha_composite(result, source)
+    elif operation == "resize":
+        result = downscale(source, options)
     else:
         raise ValueError("Unsupported image edit.")
     result.save(output_path, "PNG")
+
+
+# Plain resampling filters for making a picture smaller, sharpest first. Box averages every source
+# pixel under each new one, which keeps large reductions free of the ringing the others can add.
+RESIZE_FILTERS = {"lanczos": "LANCZOS", "bicubic": "BICUBIC", "hamming": "HAMMING", "bilinear": "BILINEAR", "box": "BOX"}
+
+
+def downscale(source, options):
+    """Shrinks the picture so its longest side is at most `longest` pixels; a smaller one stays as it is.
+
+    Pillow averages whole blocks of pixels first (`reducing_gap`) and filters only the last step, which
+    is several times faster on very large pictures and looks the same. Transparent edges keep their
+    colour, since Pillow resizes RGBA with premultiplied alpha.
+    """
+    from PIL import Image
+    longest = round(number(options.get("longest", 0), 16, 32768, "Longest side"))
+    name = options.get("filter", "lanczos")
+    if name not in RESIZE_FILTERS:
+        raise ValueError("Choose Lanczos, bicubic, Hamming, bilinear or box.")
+    scale = longest / max(source.width, source.height)
+    if scale >= 1:
+        return source
+    size = (max(1, round(source.width * scale)), max(1, round(source.height * scale)))
+    return source.resize(size, getattr(Image.Resampling, RESIZE_FILTERS[name]), reducing_gap=3.0)
 
 
 def export_image(input_path, options):

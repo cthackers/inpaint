@@ -15,11 +15,12 @@
         "title": "Inpaint",
         "width": 1380,
         "height": 860,
-        "minWidth": 820,
-        "minHeight": 600,
+        "minWidth": 1024,
+        "minHeight": 768,
         "decorations": true,
         "resizable": true,
-        "center": true
+        "center": true,
+        "dragDropEnabled": false
       }
     ],
     "security": {
