@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use rusqlite::OptionalExtension;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::Write,
     sync::{
@@ -194,14 +194,17 @@ fn checked_id(id: &str) -> Result<&str, String> {
     }
 }
 
-/// Bulk answers list each id; one already there, or already gone, counts as done.
-fn bulk_result(value: &Value) -> Result<(), String> {
-    match value.as_array().and_then(|items| items.first()) {
-        Some(item) if item["success"] == false && !matches!(item["error"].as_str(), Some("duplicate" | "not_found")) => {
-            Err(format!("Immich refused: {}", item["error"].as_str().unwrap_or("unknown error")))
+/// Every requested asset must be accounted for, including failures after the first result.
+fn bulk_result(value: &Value, adding: bool, expected: usize) -> Result<(), String> {
+    let items = value.as_array().ok_or("Immich did not confirm the asset changes.")?;
+    if items.len() != expected { return Err("Immich did not confirm every asset change.".into()); }
+    for item in items {
+        let already_done = item["error"].as_str() == Some(if adding { "duplicate" } else { "not_found" });
+        if item["success"].as_bool() != Some(true) && !already_done {
+            return Err(format!("Immich refused: {}", item["error"].as_str().unwrap_or("unknown error")));
         }
-        _ => Ok(()),
     }
+    Ok(())
 }
 
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
@@ -268,7 +271,7 @@ pub async fn immich_tag(id: String, tag_id: String, add: bool, store_id: Option<
     blocking(move || {
         let settings = settings_of_store(store_id.as_deref())?;
         let method = if add { "PUT" } else { "DELETE" };
-        bulk_result(&send(&settings, method, &format!("/api/tags/{}/assets", checked_id(&tag_id)?), Some(&json!({ "ids": [checked_id(&id)?] })))?)
+        bulk_result(&send(&settings, method, &format!("/api/tags/{}/assets", checked_id(&tag_id)?), Some(&json!({ "ids": [checked_id(&id)?] })))?, add, 1)
     })
     .await
 }
@@ -296,7 +299,7 @@ pub async fn immich_album(id: String, album_id: String, add: bool, store_id: Opt
     blocking(move || {
         let settings = settings_of_store(store_id.as_deref())?;
         let method = if add { "PUT" } else { "DELETE" };
-        bulk_result(&send(&settings, method, &format!("/api/albums/{}/assets", checked_id(&album_id)?), Some(&json!({ "ids": [checked_id(&id)?] })))?)
+        bulk_result(&send(&settings, method, &format!("/api/albums/{}/assets", checked_id(&album_id)?), Some(&json!({ "ids": [checked_id(&id)?] })))?, add, 1)
     })
     .await
 }
@@ -414,6 +417,40 @@ pub async fn immich_albums(store_id: String) -> Result<Vec<Album>, String> {
 const SEARCH_PAGE: u32 = 1000;
 const MAX_SEARCH_PAGES: u32 = 100;
 
+/// Trashed originals still exist on disk until Immich empties its trash.
+pub fn trashed_paths(store: &Store) -> Result<HashSet<String>, String> {
+    if !store.immich {
+        return Ok(HashSet::new());
+    }
+    let settings = store_settings(store)?;
+    let mut paths = HashSet::new();
+    let mut page = 1;
+    let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    while page <= MAX_SEARCH_PAGES * 10 {
+        let found = send(&settings, "POST", "/api/search/metadata", Some(&json!({
+            "withDeleted": true, "trashedBefore": now.to_rfc3339(), "size": SEARCH_PAGE, "page": page,
+        })))?;
+        let items = found["assets"]["items"].as_array().ok_or("Immich did not list the trash.")?;
+        // Some server versions may ignore a search filter. Only confirmed trash entries
+        // may suppress a duplicate, and only inside this store's configured upload folder.
+        let root = Path::new(store.immich_path.trim_end_matches('/'));
+        paths.extend(items.iter().filter(|asset| asset["isTrashed"].as_bool() == Some(true)).filter_map(|asset| {
+            if store.immich_path.trim_end_matches('/').is_empty() { return None; }
+            let original = Path::new(asset["originalPath"].as_str()?);
+            let relative = original.strip_prefix(root).ok()?;
+            if relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) { return None; }
+            Some(super::path_string(&Path::new(&store.path).join(relative)))
+        }));
+        let next = found["assets"]["nextPage"].as_str().and_then(|value| value.parse::<u32>().ok())
+            .or_else(|| found["assets"]["nextPage"].as_u64().map(|value| value as u32));
+        match next {
+            Some(value) if value > page => page = value,
+            _ => return Ok(paths),
+        }
+    }
+    Err("Immich's trash listing exceeded the page limit.".into())
+}
+
 /// Where an album's pictures are, as Immich's original paths. Immich's own album endpoint answers
 /// without its assets, so they are searched for instead.
 fn album_originals(settings: &ImmichSettings, album_id: &str) -> Result<Vec<String>, String> {
@@ -422,16 +459,16 @@ fn album_originals(settings: &ImmichSettings, album_id: &str) -> Result<Vec<Stri
     while page <= MAX_SEARCH_PAGES {
         let body = json!({ "albumIds": [album_id], "size": SEARCH_PAGE, "page": page });
         let found = send(settings, "POST", "/api/search/metadata", Some(&body))?;
-        let items = found["assets"]["items"].as_array().map(Vec::as_slice).unwrap_or_default();
+        let items = found["assets"]["items"].as_array().ok_or("Immich did not list the album's pictures.")?;
         originals.extend(items.iter().filter_map(|asset| asset["originalPath"].as_str().map(str::to_string)));
         // The next page arrives as text, and is missing on the last one.
         let next = found["assets"]["nextPage"].as_str().and_then(|value| value.parse::<u32>().ok()).or_else(|| found["assets"]["nextPage"].as_u64().map(|value| value as u32));
         match next {
             Some(value) if value > page => page = value,
-            _ => break,
+            _ => return Ok(originals),
         }
     }
-    Ok(originals)
+    Err("Immich's album listing exceeded the page limit; the metadata is incomplete.".into())
 }
 
 /// Every asset's favourite, rating and upload time, by its file on this computer, page by page.
@@ -567,7 +604,7 @@ pub async fn immich_tag_paths(store_id: String, name: String, paths: Vec<String>
         }
         let changed = ids.len();
         let method = if add { "PUT" } else { "DELETE" };
-        bulk_result(&send(&settings, method, &format!("/api/tags/{}/assets", checked_id(&tag_id)?), Some(&json!({ "ids": ids })))?)?;
+        bulk_result(&send(&settings, method, &format!("/api/tags/{}/assets", checked_id(&tag_id)?), Some(&json!({ "ids": ids })))?, add, changed)?;
         if let Some(error) = missing {
             return Err(format!("{changed} of {} pictures: {error}", paths.len()));
         }
@@ -689,15 +726,15 @@ fn tagged_originals(settings: &ImmichSettings, tag_id: &str) -> Result<Vec<Strin
     while page <= MAX_SEARCH_PAGES {
         let body = json!({ "tagIds": [checked_id(tag_id)?], "size": SEARCH_PAGE, "page": page });
         let found = send(settings, "POST", "/api/search/metadata", Some(&body))?;
-        let items = found["assets"]["items"].as_array().map(Vec::as_slice).unwrap_or_default();
+        let items = found["assets"]["items"].as_array().ok_or("Immich did not list the tagged pictures.")?;
         originals.extend(items.iter().filter_map(|asset| asset["originalPath"].as_str().map(str::to_string)));
         let next = found["assets"]["nextPage"].as_str().and_then(|value| value.parse::<u32>().ok()).or_else(|| found["assets"]["nextPage"].as_u64().map(|value| value as u32));
         match next {
             Some(value) if value > page => page = value,
-            _ => break,
+            _ => return Ok(originals),
         }
     }
-    Ok(originals)
+    Err("Immich's tag listing exceeded the page limit; the metadata is incomplete.".into())
 }
 
 #[derive(Clone, Copy)]
@@ -882,7 +919,7 @@ pub async fn immich_album_pictures_set(store_id: String, album_id: String, paths
         }
         let changed = ids.len();
         let method = if add { "PUT" } else { "DELETE" };
-        bulk_result(&send(&settings, method, &format!("/api/albums/{album_id}/assets"), Some(&json!({ "ids": ids })))?)?;
+        bulk_result(&send(&settings, method, &format!("/api/albums/{album_id}/assets"), Some(&json!({ "ids": ids })))?, add, changed)?;
         if let Some(error) = missing.into_iter().next() {
             return Err(format!("{changed} of {} pictures: {error}", paths.len()));
         }
@@ -1020,7 +1057,7 @@ pub fn add_to_album(store: &Store, album_id: &str, asset_ids: &[String]) -> Resu
     }
     let settings = store_settings(store)?;
     let ids: Vec<&str> = asset_ids.iter().map(|id| checked_id(id)).collect::<Result<_, _>>()?;
-    bulk_result(&send(&settings, "PUT", &format!("/api/albums/{}/assets", real_album(album_id)?), Some(&json!({ "ids": ids })))?)
+    bulk_result(&send(&settings, "PUT", &format!("/api/albums/{}/assets", real_album(album_id)?), Some(&json!({ "ids": ids })))?, true, ids.len())
 }
 
 /// Where an asset's original is on this computer, when it lies in the store folder.
@@ -1075,8 +1112,23 @@ pub fn refresh_saved_picture(path: &Path, size_changed: bool) -> Option<String> 
     })
 }
 
-/// Moves a picture of an Immich-compatible store to Immich's trash, which removes the file when it is
-/// emptied. Deleting the file directly would leave Immich with a broken asset. None outside such stores.
+/// Trashed originals still exist on disk, so filesystem checks alone cannot validate an Immich keeper.
+pub(crate) fn ensure_keeper_available(path: &Path) -> Result<(), String> {
+    let canonical = fs::canonicalize(path).map_err(|error| format!("Cannot check the picture being kept: {error}"))?;
+    let Some(asset) = find_asset(&canonical) else { return Ok(()) };
+    let (settings, id) = asset?;
+    ensure_asset_live(&settings, &id)
+}
+
+fn ensure_asset_live(settings: &ImmichSettings, id: &str) -> Result<(), String> {
+    let asset = send(settings, "GET", &format!("/api/assets/{}", checked_id(id)?), None)?;
+    if asset["isTrashed"].as_bool() != Some(false) {
+        return Err("Immich could not confirm that the picture being kept is outside the trash. Duplicate deletion stopped.".into());
+    }
+    Ok(())
+}
+
+/// Trash an Immich original through its server, leaving local trash to ordinary folders.
 pub fn trash_picture(path: &Path) -> Option<Result<String, String>> {
     Some(
         find_asset(path)?
@@ -1091,6 +1143,74 @@ pub fn trash_picture(path: &Path) -> Option<Result<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::{super::http::test_server::*, *};
+
+    #[test]
+    fn a_keeper_in_immich_trash_cannot_justify_deleting_a_live_copy() {
+        let id = "11111111-1111-1111-1111-111111111111";
+        for (body, available) in [(br#"{"isTrashed":false}"#.as_slice(), true),
+                                  (br#"{"isTrashed":true}"#.as_slice(), false), (b"{}".as_slice(), false)] {
+            let (base, server) = serve(vec![answer("200 OK", &[], body)]);
+            assert_eq!(ensure_asset_live(&settings(base), id).is_ok(), available);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn every_bulk_change_must_be_confirmed_before_duplicate_deletion() {
+        assert!(bulk_result(&json!([{"success":true},{"success":false,"error":"forbidden"}]), true, 2).is_err());
+        assert!(bulk_result(&json!([{"success":true},{"success":false,"error":"duplicate"}]), true, 2).is_ok());
+        assert!(bulk_result(&json!([{"success":false,"error":"not_found"}]), true, 1).is_err());
+        assert!(bulk_result(&json!([{"success":false,"error":"not_found"}]), false, 1).is_ok());
+        assert!(bulk_result(&json!([{"success":true}]), true, 2).is_err());
+        assert!(bulk_result(&json!([{}]), true, 1).is_err());
+        assert!(bulk_result(&json!(null), true, 1).is_err());
+    }
+
+    #[test]
+    fn malformed_metadata_pages_are_errors_not_empty_indexes() {
+        let (base, server) = serve(vec![answer("200 OK", &[], br#"{"assets":{}}"#)]);
+        assert!(album_originals(&settings(base), "album").is_err());
+        server.join().unwrap();
+        let (base, server) = serve(vec![answer("200 OK", &[], br#"{"assets":{}}"#)]);
+        assert!(tagged_originals(&settings(base), "11111111-1111-1111-1111-111111111111").is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn trash_paths_include_every_page() {
+        let (base, server) = serve(vec![
+            answer("200 OK", &[], br#"{"assets":{"items":[{"originalPath":"/upload/ab/cd/abcd.jpg","isTrashed":true}],"nextPage":"2"}}"#),
+            answer("200 OK", &[], br#"{"assets":{"items":[{"originalPath":"/upload/ef/01/ef01.jpg","isTrashed":true}],"nextPage":null}}"#),
+        ]);
+        let store = Store { path: "/pictures".into(), immich: true, immich_path: "/upload".into(), immich_url: base, immich_key: "key".into(), ..Default::default() };
+        let paths = trashed_paths(&store).unwrap();
+        assert_eq!(paths, HashSet::from(["/pictures/ab/cd/abcd.jpg".into(), "/pictures/ef/01/ef01.jpg".into()]));
+        let requests = server.join().unwrap();
+        for (index, request) in requests.iter().enumerate() {
+            assert!(request.starts_with("POST /api/search/metadata "));
+            let body: Value = serde_json::from_str(request.rsplit("\r\n").next().unwrap()).unwrap();
+            assert_eq!(body["withDeleted"], true);
+            assert!(chrono::DateTime::parse_from_rfc3339(body["trashedBefore"].as_str().unwrap()).is_ok());
+            assert!(body.get("isTrashed").is_none());
+            assert_eq!(body["page"], index + 1);
+        }
+        assert!(trashed_paths(&Store::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn trash_filter_keeps_live_unconfirmed_and_other_store_pictures() {
+        let (base, server) = serve(vec![answer("200 OK", &[], br#"{"assets":{"items":[
+            {"originalPath":"/upload/ab/cd/abcd-live.jpg","isTrashed":false},
+            {"originalPath":"/upload/ab/cd/abcd-unknown.jpg"},
+            {"originalPath":"/another-store/ab/cd/abcd-copy.jpg","isTrashed":true},
+            {"originalPath":"/upload-other/ab/cd/abcd-copy.jpg","isTrashed":true},
+            {"originalPath":"/upload/../another-store/ab/cd/abcd-copy.jpg","isTrashed":true},
+            {"originalPath":"/upload/ab/cd/abcd-trash.jpg","isTrashed":true}
+        ],"nextPage":null}}"#)]);
+        let store = Store { path: "/pictures".into(), immich: true, immich_path: "/upload/".into(), immich_url: base, immich_key: "key".into(), ..Default::default() };
+        assert_eq!(trashed_paths(&store).unwrap(), HashSet::from(["/pictures/ab/cd/abcd-trash.jpg".into()]));
+        server.join().unwrap();
+    }
 
     fn settings(url: String) -> ImmichSettings {
         ImmichSettings { url, api_key: "secret-key".into() }

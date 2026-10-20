@@ -55,7 +55,7 @@ pub struct StoreStats {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreContents {
-    images: Vec<ImageEntry>,
+    pub(crate) images: Vec<ImageEntry>,
     stats: StoreStats,
 }
 
@@ -222,6 +222,7 @@ pub fn store_remove(app: AppHandle, id: String) -> Result<(), String> {
     let _ = cache.execute("DELETE FROM store_album_scans WHERE store_id = ?1", [&id]);
     let _ = cache.execute("DELETE FROM store_facts WHERE store_id = ?1", [&id]);
     drop(cache);
+    super::duplicates::forget_store(&id);
     super::dropbox::refresh(&app);
     Ok(())
 }
@@ -331,8 +332,13 @@ pub fn record_picture(path: &Path) {
 /// Removes a deleted picture from every store index and from the albums holding it.
 pub fn forget_picture(path: &Path) {
     let path = super::path_string(path);
-    if let Err(error) = db::cache_db().execute("DELETE FROM store_pictures WHERE path = ?1", [&path]) {
-        eprintln!("Cannot update the store index: {error}");
+    let removed = db::cache_db().prepare("DELETE FROM store_pictures WHERE path = ?1 RETURNING store_id")
+        .and_then(|mut statement| statement.query_map([&path], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>());
+    match removed {
+        Ok(stores) => {
+            for store_id in stores { super::duplicates::invalidate_result(&store_id); }
+        }
+        Err(error) => eprintln!("Cannot update the store index: {error}"),
     }
     super::albums::forget_picture(&path);
     super::pictures::forget_picture(&path);
@@ -502,6 +508,16 @@ mod tests {
         // A rescan replaces the rows rather than adding to them.
         write_index(&connection, "s", &contents).unwrap();
         assert_eq!(read_index(&connection, "s").unwrap().unwrap().images.len(), 2);
+        // Emptying trash and importing pictures can leave the old index entirely wrong.
+        fs::remove_file(root.path().join("ab/cd/abcd-old.jpg")).unwrap();
+        fs::remove_file(root.path().join("ab/cd/abcd-new.webp")).unwrap();
+        touch(root.path(), "12/34/1234-live.jpg", 5);
+        touch(root.path(), "12/34/1234-copy.jpg", 5);
+        let refreshed = scan(root.path(), |_, _| {}).unwrap();
+        write_index(&connection, "s", &refreshed).unwrap();
+        let current = read_index(&connection, "s").unwrap().unwrap();
+        let names: HashSet<_> = current.images.iter().map(|image| image.name.as_str()).collect();
+        assert_eq!(names, HashSet::from(["1234-live.jpg", "1234-copy.jpg"]));
     }
 
     // INPAINT_TEST_STORE=/mnt/Immich/upload/<user> cargo test real_store -- --ignored --nocapture

@@ -15,6 +15,7 @@ type DropboxSettings = {
   monitor: "left" | "middle" | "right";
   /** The album each store's dropped pictures join, by store id. */
   albums: Record<string, string>;
+  clearMetadata: Record<string, boolean>;
 };
 type DropboxStatus = { settings: DropboxSettings; hotkeys: boolean };
 
@@ -88,6 +89,13 @@ export default function DropboxTab({ stores }: { stores: Store[] }) {
         ? "Pictures are uploaded to Immich, which files them and skips pictures it already has."
         : "Pictures are saved as ab/cd/<SHA-1>.jpg, and a picture already in the store is skipped."}</small>
       {store && <>
+        <label className="check-label"><input type="checkbox" checked={!!draft.clearMetadata?.[store.id]} disabled={busy}
+          onChange={(e) => {
+            const next = { ...(draft.clearMetadata ?? {}) };
+            if (e.target.checked) next[store.id] = true; else delete next[store.id];
+            update({ clearMetadata: next });
+          }} /> Clear metadata</label>
+        <small>Remove embedded tags, ratings, notes, dates, location and camera details before saving or uploading to this store. Keeps orientation and colour information. Original files are unchanged. Uses ExifTool; if cleanup fails, the original is saved or uploaded as-is. Each store keeps its own choice.</small>
         <label>Add to album<Select value={albums?.some((album) => album.id === draft.albums?.[store.id]) ? draft.albums[store.id] : ""}
           disabled={busy || !albums} onChange={(e) => {
             const next = { ...(draft.albums ?? {}) };

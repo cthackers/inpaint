@@ -14,6 +14,7 @@ mod albums;
 mod animation;
 mod db;
 mod dropbox;
+mod duplicates;
 mod hidden;
 mod http;
 mod immich;
@@ -254,18 +255,25 @@ fn prune_thumbnail_cache() {
 }
 
 /// A picture's thumbnail, a JPEG of at most 480×360, from the disk cache or made now. An animated one
-/// is a GIF of the same size with every frame, which the gallery plays while the pointer is on the card.
+/// is a bounded GIF preview, which the gallery plays while the pointer is on the card.
 fn thumbnail_bytes(path: &Path, animated: bool) -> Result<Vec<u8>, String> {
     let extension = picture_extension(path).ok_or("Only PNG, JPG, WebP, GIF, BMP and TIFF images are supported")?;
     let animated = animated && extension == "gif";
     let metadata = fs::metadata(path).map_err(|error| format!("Cannot read image: {error}"))?;
-    let cached = if animated { thumbnail_cache_named(path, &metadata, "gif") } else { thumbnail_cache_file(path, &metadata) };
+    // Version animated previews so old, unbounded GIFs cannot bypass the new limits.
+    let cached = if animated { thumbnail_cache_named(path, &metadata, "preview-v2.gif") } else { thumbnail_cache_file(path, &metadata) };
     let file_name = cached.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     if let Ok(bytes) = fs::read(&cached) {
         thumbnail_used(&file_name, bytes.len());
         return Ok(bytes);
     }
-    let thumbnail = THUMBNAIL_MAKERS.run(|| if animated { animation::thumbnail(path) } else { make_thumbnail(path, &extension) })?;
+    let thumbnail = if animated {
+        // Hover requests that arrive while decoding should keep the still thumbnail,
+        // rather than queue work for cards the pointer has already left.
+        ANIMATION_MAKERS.try_run(|| animation::thumbnail(path)).ok_or("Another animation preview is being prepared.")?
+    } else {
+        THUMBNAIL_MAKERS.run(|| make_thumbnail(path, &extension))
+    }?;
     if fs::create_dir_all(thumbnail_cache_dir()).is_ok() && replace_file(&cached, &thumbnail).is_ok() {
         thumbnail_used(&file_name, thumbnail.len());
         prune_thumbnail_cache();
@@ -321,6 +329,15 @@ impl Drop for Permit<'_> {
 }
 
 impl Workers {
+    fn try_run<T>(&self, work: impl FnOnce() -> T) -> Option<T> {
+        let mut free = self.free.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *free == 0 { return None; }
+        *free -= 1;
+        drop(free);
+        let _permit = Permit(self);
+        Some(work())
+    }
+
     fn run<T>(&self, work: impl FnOnce() -> T) -> T {
         let mut free = self.free.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         while *free == 0 {
@@ -338,6 +355,9 @@ static THUMBNAIL_MAKERS: LazyLock<Workers> = LazyLock::new(|| Workers {
     free: Mutex::new(std::thread::available_parallelism().map_or(4, |cores| cores.get()).clamp(2, 16)),
     released: Condvar::new(),
 });
+
+// Animated previews decode full-size frames; keep their memory budget independent of stills.
+static ANIMATION_MAKERS: Workers = Workers { free: Mutex::new(1), released: Condvar::new() };
 
 fn make_thumbnail(path: &Path, extension: &str) -> Result<Vec<u8>, String> {
     // ImageMagick is heavily optimized even while this app is running as a
@@ -515,8 +535,16 @@ struct Deletion {
 /// Deletes a picture: through Immich for Immich-compatible stores, otherwise into the desktop trash.
 /// `permanent` removes the file for good, for when the trash is unavailable, as on some network shares.
 #[tauri::command]
-async fn delete_image(path: String, permanent: bool) -> Result<Deletion, String> {
+async fn delete_image(path: String, permanent: bool, expected: Option<duplicates::DuplicatePicture>, keepers: Option<Vec<duplicates::DuplicatePicture>>) -> Result<Deletion, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        if let Some(expected) = expected {
+            if expected.path != path { return Err("Duplicate deletion does not match the selected picture.".into()); }
+            expected.validate()?;
+            for keeper in keepers.unwrap_or_default() {
+                keeper.validate()?;
+                immich::ensure_keeper_available(Path::new(&keeper.path))?;
+            }
+        }
         let file = PathBuf::from(&path);
         if picture_extension(&file).is_none() || !file.is_file() {
             return Err(format!("{path} is not a picture."));
@@ -1101,6 +1129,11 @@ pub fn run() {
             hidden::hidden_configure,
             stores::store_cached,
             stores::store_scan,
+            duplicates::duplicates_cached,
+            duplicates::duplicates_search,
+            duplicates::duplicates_cancel,
+            duplicates::duplicates_clear,
+            duplicates::duplicates_validate,
             immich::immich_settings,
             immich::immich_configure,
             immich::immich_test,
@@ -1172,6 +1205,7 @@ pub fn run() {
 
     app.run(move |_app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            duplicates::shutdown();
             shutdown_state.shutdown();
             db::checkpoint();
         }

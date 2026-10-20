@@ -7,7 +7,7 @@ use argon2::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter};
 
 static REVEALED: AtomicBool = AtomicBool::new(false);
 static LAST_USE: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_USES: AtomicUsize = AtomicUsize::new(0);
 
 const SETTING: &str = "hidden";
 const DEFAULT_MINUTES: u32 = 10;
@@ -61,6 +62,29 @@ pub fn revealed() -> bool {
 /// Notes that the app is in use, which puts off hiding again.
 pub fn touch() {
     LAST_USE.store(now_ms(), Ordering::SeqCst);
+}
+
+/// Counts a long-running operation as use even while its worker is silent. This only
+/// prevents automatic hiding; it never reveals stores that the user manually locked.
+pub(crate) struct BackgroundActivity;
+
+pub(crate) fn keep_active() -> BackgroundActivity {
+    BACKGROUND_USES.fetch_add(1, Ordering::SeqCst);
+    touch();
+    BackgroundActivity
+}
+
+impl Drop for BackgroundActivity {
+    fn drop(&mut self) {
+        // Give the user the full idle timeout after success, cancellation or an error.
+        touch();
+        BACKGROUND_USES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn idle_expired(now: u64, minutes: u32) -> bool {
+    BACKGROUND_USES.load(Ordering::SeqCst) == 0 && minutes > 0
+        && now.saturating_sub(LAST_USE.load(Ordering::SeqCst)) > u64::from(minutes) * 60_000
 }
 
 fn hash(password: &str) -> Result<String, String> {
@@ -148,7 +172,7 @@ pub fn start(app: &AppHandle) {
             continue;
         }
         let minutes = load().timeout_minutes;
-        if minutes > 0 && now_ms().saturating_sub(LAST_USE.load(Ordering::SeqCst)) > u64::from(minutes) * 60_000 {
+        if idle_expired(now_ms(), minutes) {
             conceal(&app);
         }
     });
@@ -157,6 +181,34 @@ pub fn start(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_work_prevents_timeout_then_restarts_it_without_unlocking() {
+        let activity = keep_active();
+        LAST_USE.store(1_000, Ordering::SeqCst);
+        // No progress messages or mouse movement for ten hours must still count as use.
+        assert!(!idle_expired(1_000 + 10 * 60 * 60_000, 10));
+
+        // Ending another operation (including an early error) cannot release this one.
+        let failed = || -> Result<(), ()> {
+            let _activity = keep_active();
+            Err(())
+        };
+        assert!(failed().is_err());
+        assert_eq!(BACKGROUND_USES.load(Ordering::SeqCst), 1);
+
+        // Manual locking remains effective throughout the operation and after it ends.
+        REVEALED.store(false, Ordering::SeqCst);
+        let before = now_ms();
+        drop(activity);
+        let finished = LAST_USE.load(Ordering::SeqCst);
+        assert!(finished >= before);
+        assert_eq!(BACKGROUND_USES.load(Ordering::SeqCst), 0);
+        assert!(!revealed());
+        assert!(!idle_expired(finished + 10 * 60_000, 10));
+        assert!(idle_expired(finished + 10 * 60_000 + 1, 10));
+        assert!(!idle_expired(finished + 24 * 60 * 60_000, 0));
+    }
 
     #[test]
     fn passwords_are_kept_as_salted_hashes() {

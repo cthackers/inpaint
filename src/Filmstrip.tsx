@@ -15,6 +15,8 @@ type Props = {
   index: number;
   box: ViewportBox;
   disabled: boolean;
+  /** Going through a group of duplicates: which pictures are kept, by path. */
+  keeps?: Record<string, boolean>;
   onJump: (index: number) => void;
 };
 
@@ -25,7 +27,7 @@ type Props = {
  * scrolls this strip instead of building it again. A store holds tens of thousands of pictures, so only
  * the frames near the view exist.
  */
-export default function Filmstrip({ pictures, index, box, disabled, onJump }: Props) {
+export default function Filmstrip({ pictures, index, box, disabled, keeps, onJump }: Props) {
   const strip = useRef<HTMLDivElement>(null);
   const [view, setView] = useState({ left: 0, width: 0 });
   const first = Math.max(0, Math.floor(view.left / FRAME_STEP) - FRAME_OVERSCAN);
@@ -64,9 +66,11 @@ export default function Filmstrip({ pictures, index, box, disabled, onJump }: Pr
     <div className="filmstrip-track" style={{ width: pictures.length * FRAME_STEP - (FRAME_STEP - FRAME_WIDTH) }}>
       {pictures.slice(first, last).map((picture, offset) => {
         const at = first + offset;
-        return <button key={picture.path} className={`filmstrip-frame ${at === index ? "current" : ""}`} style={{ left: at * FRAME_STEP }}
-          title={picture.name} disabled={disabled} onClick={() => { if (at !== index) onJump(at); }}>
+        const keep = keeps?.[picture.path];
+        return <button key={picture.path} className={`filmstrip-frame ${at === index ? "current" : ""} ${keep === undefined ? "" : keep ? "keep" : "drop"}`} style={{ left: at * FRAME_STEP }}
+          title={keep === undefined ? picture.name : `${picture.name} · ${keep ? "kept" : "deleted"}`} disabled={disabled} onClick={() => { if (at !== index) onJump(at); }}>
           <img src={`${convertFileSrc(picture.path, "thumb")}?v=${picture.size}-${picture.modifiedMs}`} alt="" draggable={false} decoding="async" />
+          {keep !== undefined && <span className="filmstrip-verdict">{keep ? "Keep" : "Delete"}</span>}
         </button>;
       })}
     </div>

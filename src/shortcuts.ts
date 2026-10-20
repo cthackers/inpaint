@@ -48,6 +48,7 @@ export const SHORTCUTS = [
   { id: "editor.actualSize", group: "Editor", label: "Actual size", keys: "NumpadDivide" },
   { id: "editor.zoomIn", group: "Editor", label: "Zoom in", keys: "NumpadAdd" },
   { id: "editor.zoomOut", group: "Editor", label: "Zoom out", keys: "NumpadSubtract" },
+  { id: "editor.keep", group: "Editor", label: "Keep or delete, in a group of duplicates", keys: "K" },
 ] as const;
 
 export type ShortcutId = (typeof SHORTCUTS)[number]["id"];

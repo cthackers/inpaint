@@ -1,12 +1,13 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import { ArrowDownUp, Columns3, Folder, Heart, FolderMinus, FolderPlus, Images, Info, Image as ImageIcon, ImagePlus, LayoutGrid, Pencil, Search, Star, Tag as TagIcon, Trash2, X } from "lucide-react";
+import { ArrowDownUp, Columns3, Copy, Folder, Heart, FolderMinus, FolderPlus, Images, Info, Image as ImageIcon, ImagePlus, LayoutGrid, Pencil, Search, Star, Tag as TagIcon, Trash2, X } from "lucide-react";
 import FolderNode from "./FolderTree";
 import { SettingsButton } from "./Settings";
 import { NewStoreDialog, SourcePicker, StorePanel } from "./Stores";
 import AlbumsPanel, { albumOptions, NameDialog, PICTURE_DRAG, type AlbumView } from "./Albums";
 import TagsPanel, { type TagView } from "./Tags";
+import { DuplicateGroups, DuplicatesPanel, type DuplicateView } from "./Duplicates";
 import { DEFAULT_GALLERY_ORDER, type GalleryOrder, type ImageEntry, type PictureFacts, type Store, type StoreStats } from "./types";
 import { storage } from "./storage";
 import { usePreference } from "./preferences";
@@ -27,6 +28,7 @@ export type StoreView = {
   dropMessage: string;
   onDropMessageClear: () => void;
   tags: TagView;
+  duplicates: DuplicateView;
   onOpen: (id: string) => void;
   onCreated: (store: Store) => void;
   onChanged: (store: Store) => void;
@@ -69,11 +71,12 @@ const baseName = (path: string) => path.split("/").filter(Boolean).at(-1) ?? pat
 const leafTags = (tags: string[] | undefined) =>
   (tags ?? []).filter((tag) => !tags?.some((other) => other !== tag && other.startsWith(`${tag}/`))).sort((a, b) => a.localeCompare(b));
 
-type StoreTab = "albums" | "tags" | "info";
+type StoreTab = "albums" | "tags" | "duplicates" | "info";
 /** The sidebar's panels for an open store, in the order their tabs stand. */
 const STORE_TABS: { id: StoreTab; label: string; icon: typeof Images }[] = [
   { id: "albums", label: "Albums", icon: Images },
   { id: "tags", label: "Tags", icon: TagIcon },
+  { id: "duplicates", label: "Duplicates", icon: Copy },
   { id: "info", label: "Info", icon: Info },
 ];
 
@@ -128,7 +131,24 @@ function Thumbnail({ image, row, onShape }: { image: ImageEntry; row: number; on
   // A GIF plays while the pointer is on its card; the moving thumbnail covers the still one once it loaded.
   const [hovered, setHovered] = useState(false);
   const [moving, setMoving] = useState(false);
+  const [playPreview, setPlayPreview] = useState(false);
   const animated = image.extension === "gif";
+  useEffect(() => {
+    setPlayPreview(false);
+    setMoving(false);
+    if (!hovered || !animated) return;
+    // Passing over cards while scrolling should not start a batch of GIF decoders.
+    const timer = window.setTimeout(() => setPlayPreview(true), 200);
+    const stop = () => { window.clearTimeout(timer); setHovered(false); setPlayPreview(false); setMoving(false); };
+    const visibility = () => { if (document.hidden) stop(); };
+    window.addEventListener("blur", stop);
+    document.addEventListener("visibilitychange", visibility);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("blur", stop);
+      document.removeEventListener("visibilitychange", visibility);
+    };
+  }, [hovered, animated, url]);
   const holdsTurn = useRef(false);
   const release = useCallback(() => {
     if (!holdsTurn.current) return;
@@ -170,8 +190,9 @@ function Thumbnail({ image, row, onShape }: { image: ImageEntry; row: number; on
           release();
         }}
         onError={release} />}
-      {hovered && shown && <img src={`${url}&animated`} alt="" draggable={false} decoding="async"
-        className={`thumbnail-animation ${moving ? "shown" : ""}`} onLoad={() => setMoving(true)} />}
+      {hovered && playPreview && shown && <img src={`${url}&animated&preview=2`} alt="" draggable={false} decoding="async"
+        className={`thumbnail-animation ${moving ? "shown" : ""}`} onLoad={() => setMoving(true)}
+        onError={() => { setPlayPreview(false); setMoving(false); }} />}
       <div className="edit-hint">Double-click to edit</div>
     </div>
   );
@@ -385,6 +406,8 @@ export default function BrowserView({
     const saved = storage.getItem("inpaint.storeTab");
     return STORE_TABS.some((tab) => tab.id === saved) ? saved as StoreTab : "albums";
   });
+  // The Duplicates tab shows its groups in place of the gallery.
+  const duplicatesShown = !!store.active && storeTab === "duplicates";
   // Pictures picked in the gallery, by path, for adding several of them to an album at once.
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   const chosenAnchor = useRef<number | null>(null);
@@ -552,7 +575,7 @@ export default function BrowserView({
     const observer = new ResizeObserver(measure);
     observer.observe(gallery);
     return () => observer.disconnect();
-  }, [showsGrid]);
+  }, [showsGrid, duplicatesShown]);
 
   useLayoutEffect(() => {
     if (galleryRef.current) setFirstRow(rowAt(galleryRef.current.scrollTop));
@@ -560,14 +583,14 @@ export default function BrowserView({
   }, [grid, rowStep, images.length]);
 
   useLayoutEffect(() => {
-    if (loading || !viewKey || restoredViewRef.current === viewKey) return;
+    if (loading || duplicatesShown || !viewKey || restoredViewRef.current === viewKey) return;
     const gallery = galleryRef.current;
     if (!gallery || (images.length && !grid.width)) return;
     gallery.scrollTop = initialScrollTop;
     restoredViewRef.current = viewKey;
     setFirstRow(rowAt(gallery.scrollTop));
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [viewKey, images.length, initialScrollTop, loading, grid.width]);
+  }, [viewKey, images.length, initialScrollTop, loading, grid.width, duplicatesShown]);
 
   // Thumbnails nearest the middle of the view load first.
   useEffect(() => {
@@ -612,6 +635,10 @@ export default function BrowserView({
     ? `Tagged ${tag} in ${store.active?.name ?? "the store"}`
     : album ? `Album of ${store.active?.name ?? "the store"}` : store.active ? store.active.path : currentPath ?? "Open a folder containing PNG, JPG, WebP, GIF, BMP, or TIFF images.";
   const scanningStore = !!store.active && !!store.progress;
+  useEffect(() => {
+    // Back from the groups, the gallery returns to where it was scrolled.
+    if (duplicatesShown) restoredViewRef.current = null;
+  }, [duplicatesShown]);
 
   return (
     <div className="browser-shell">
@@ -636,6 +663,7 @@ export default function BrowserView({
           <div className="sidebar-panel">
             {storeTab === "albums" && <AlbumsPanel view={store.albums} />}
             {storeTab === "tags" && <TagsPanel view={store.tags} />}
+            {storeTab === "duplicates" && <DuplicatesPanel view={store.duplicates} />}
             {storeTab === "info" && <StorePanel
               store={store.active}
               revealed={store.revealed}
@@ -674,13 +702,13 @@ export default function BrowserView({
           setFirstRow(rowAt(scrollTop));
           setScrolled(scrollTop > 4);
           setScrollTop(scrollTop);
-          if (!loading && restoredViewRef.current === viewKey) onScrollPositionChange(scrollTop);
+          if (!loading && !duplicatesShown && restoredViewRef.current === viewKey) onScrollPositionChange(scrollTop);
         }}
       >
         <header className={`gallery-header ${scrolled ? "stuck" : ""}`}>
           <div>
-            <h1>{title}</h1>
-            <p title={store.active?.path ?? currentPath ?? undefined}>{subtitle}</p>
+            <h1>{duplicatesShown ? "Duplicates" : title}</h1>
+            <p title={store.active?.path ?? currentPath ?? undefined}>{duplicatesShown ? `Copies of the same picture in ${store.active?.name ?? "the store"}` : subtitle}</p>
           </div>
           {/* Everything after the title keeps together at the right edge, next to the layout button. */}
           <div className="gallery-header-actions">
@@ -689,7 +717,9 @@ export default function BrowserView({
             Drop to save into {store.windowDrop ? `“${store.albums.albums.find((album) => album.id === store.windowDrop)?.name ?? "the album"}”` : `“${store.active?.name ?? "the store"}”`}
           </div>}
           {store.dropMessage && store.windowDrop === null && <div className="gallery-notice" role="status">{store.dropMessage}<button aria-label="Hide" onClick={store.onDropMessageClear}><X size={13} /></button></div>}
-          {chosen.size > 0 ? <div className="chosen-bar">
+          {duplicatesShown ? <div className="image-count">
+            {store.duplicates.groups.length.toLocaleString()} {store.duplicates.groups.length === 1 ? "group" : "groups"}
+          </div> : chosen.size > 0 ? <div className="chosen-bar">
             <span>{chosen.size.toLocaleString()} picked</span>
             {store.albums.selected && !store.albums.selected.isVirtual && <button title={`Remove the picked pictures from “${store.albums.selected.fullName || store.albums.selected.name}”`}
               onClick={() => { store.albums.onRemovePictures(store.albums.selected!, [...chosen]); setChosen(new Set()); }}>
@@ -707,8 +737,8 @@ export default function BrowserView({
           </div> : viewKey && !loading && <div className="image-count" title={leftOut ? `${leftOut.toLocaleString()} left out by the filters` : undefined}>
             {images.length.toLocaleString()} {images.length === 1 ? "image" : "images"}{leftOut > 0 && ` · ${leftOut.toLocaleString()} hidden`}
           </div>}
-          <OrderPicker order={order} onOrder={onOrder} choices={orderChoices} />
-          <div className="layout-picker" ref={layoutMenu}>
+          {!duplicatesShown && <OrderPicker order={order} onOrder={onOrder} choices={orderChoices} />}
+          {!duplicatesShown && <div className="layout-picker" ref={layoutMenu}>
             <button className="icon-button" aria-haspopup="dialog" aria-expanded={layoutOpen} title="Layout and thumbnail size" aria-label="Layout and thumbnail size"
               onClick={() => setLayoutOpen(!layoutOpen)}><LayoutGrid size={17} /></button>
             {layoutOpen && <div className="layout-menu" role="dialog" aria-label="Layout">
@@ -726,11 +756,13 @@ export default function BrowserView({
                   onChange={(event) => setCardWidth(Number(event.target.value))} />
               </label>
             </div>}
-          </div>
+          </div>}
           </div>
         </header>
 
-        {loading || (scanningStore && !images.length) ? (
+        {duplicatesShown ? (
+          <DuplicateGroups view={store.duplicates} />
+        ) : loading || (scanningStore && !images.length) ? (
           <div className="center-state"><span className="spinner" />{store.active ? "Scanning store" : "Loading images"}</div>
         ) : images.length ? (
           <div className={`image-grid ${masonry ? "masonry" : ""}`} ref={gridRef} style={{ height: masonry ? masonry.height : rowCount * rowStep - GRID_GAP }}>{rows}</div>

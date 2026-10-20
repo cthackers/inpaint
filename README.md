@@ -117,6 +117,7 @@ Install the build prerequisites:
 - Rust stable and Cargo (installation through [rustup](https://rustup.rs/) is recommended)
 - Tauri's Linux/WebKitGTK development libraries
 - ImageMagick, recommended for fast gallery thumbnails
+- ExifTool, optional; required for the drop box's per-store **Clear metadata** option
 - Docker or Podman, only for building the AppImage
 
 Fedora:
@@ -613,6 +614,14 @@ menu, to change the store or save the clipboard.
   `ab/cd/<sha1>.jpg`, and a picture whose hash is already in the store is skipped.
 - Immich-compatible stores get the picture uploaded through Immich, which files it
   and skips pictures it already has.
+- **Clear metadata**, in the drop box settings or its right-click menu, is saved
+  separately for each store and is off by default. It removes embedded tags, ratings,
+  notes, dates, GPS and camera details from a temporary copy before hashing and
+  saving/uploading. Orientation and colour information are kept; original files
+  are unchanged. It also applies to clipboard, link and main-window drops into that
+  store. Install ExifTool to use it. If cleanup fails, the original is saved/uploaded
+  as-is and the drop report says its metadata was kept. Existing Immich assets are
+  not modified.
 - The area flashes green when a picture is saved, amber when it was already there,
   and red when saving failed, with the reason shown for a few seconds. Pictures
   saved into the open store, or its open album, appear in the gallery at once.

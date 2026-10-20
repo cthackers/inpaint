@@ -88,7 +88,7 @@ export function HiddenTab() {
       <label>Hide again after this many minutes without use
         <input type="number" min={0} max={1440} value={minutes} onChange={(event) => setMinutes(Math.max(0, Math.min(1440, Math.round(Number(event.target.value) || 0))))} />
       </label>
-      <small>Using the app, dropping pictures on the drop box and API requests all count as use. 0 keeps them shown until Ctrl+Alt+H.</small>
+      <small>Using the app, running duplicate searches, dropping pictures on the drop box and API requests all count as use. After a duplicate search ends, the full idle timeout starts again. 0 keeps them shown until Ctrl+Alt+H.</small>
     </div>
     <div className="settings-actions">
       {message && <p className="server-message">{message}</p>}

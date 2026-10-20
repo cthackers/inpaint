@@ -56,10 +56,8 @@ type EditorProps = {
   onBusy?: (busy: boolean) => void;
   /** Filled with a way to open another picture, with the same questions as the arrows ask. */
   navigator?: MutableRefObject<((index: number) => void) | null>;
-  /** The picture as it stood on screen when another one opens, so App can let it fade out. */
-  onLeaving?: (snapshot: { src: string; rect: DOMRect }) => void;
-  /** The picture has painted in place. */
-  onShown?: () => void;
+  /** Set while going through a group of duplicates: whether this picture is kept, and switching that. */
+  duplicate?: { keep: boolean; onToggle: () => void };
 };
 
 export type FaceSwapSource = { path: string; data: string };
@@ -155,7 +153,7 @@ const DOCK_TABS: { id: DockTab; label: string; icon: typeof History }[] = [
   { id: "memory", label: "Memory", icon: Cpu },
 ];
 
-export default function Editor({ image, index, total, brushSize, onBrushSizeChange, faceSwapSource, onFaceSwapSourceChange, onFaceSwapSourceClear, onExit, onNavigate, initialData, replaceRequested, onReplace, onReplaceCancel, onSaved, onDeleted, immichStores, stripOpen = false, onStripToggle, onViewport, onBusy, navigator, onLeaving, onShown }: EditorProps) {
+export default function Editor({ image, index, total, brushSize, onBrushSizeChange, faceSwapSource, onFaceSwapSourceChange, onFaceSwapSourceClear, onExit, onNavigate, initialData, replaceRequested, onReplace, onReplaceCancel, onSaved, onDeleted, immichStores, stripOpen = false, onStripToggle, onViewport, onBusy, navigator, duplicate }: EditorProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const maskRef = useRef<HTMLCanvasElement>(null);
   const drawing = useRef(false);
@@ -319,7 +317,6 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   );
   const scale = fitScale * zoom;
 
-  // The picture on screen, for the fade when another one opens.
   // "Loading image" only appears when a picture takes a while; a quick switch would just flash it.
   const [slowLoad, setSlowLoad] = useState(false);
   useEffect(() => {
@@ -328,10 +325,6 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     const late = window.setTimeout(() => setSlowLoad(true), 450);
     return () => window.clearTimeout(late);
   }, [imageData]);
-  const leavingSource = useRef("");
-  leavingSource.current = imageData;
-  const leaving = useRef(onLeaving);
-  leaving.current = onLeaving;
 
   const clearMask = useCallback(() => {
     const canvas = maskRef.current;
@@ -339,16 +332,10 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     setMaskDirty(false);
   }, []);
 
-  // Another picture opens in the same editor, so the panels, the strip and the scroll stay put. What
-  // belonged to the last picture is put back, and the picture on screen is handed over to fade out.
-  const shownPath = useRef("");
-  useEffect(() => {
+  // Reset before painting the new path: old pixels, GIFs and overlays must never be shown
+  // with the next picture's props. Keep the editor's panels and scroll position mounted.
+  useLayoutEffect(() => {
     let active = true;
-    const stage = stageRef.current;
-    if (shownPath.current && shownPath.current !== image.path && stage && leavingSource.current) {
-      leaving.current?.({ src: leavingSource.current, rect: stage.getBoundingClientRect() });
-    }
-    shownPath.current = image.path;
     history.reset("");
     setOriginalImageData("");
     setAnimation(null);
@@ -414,12 +401,12 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
         setOriginalImageData(data);
       })
       .catch((error) => active && setMessage(String(error)));
-    return () => { active = false; };
+    return () => {
+      active = false;
+      if (stageReadyFrame.current !== null) cancelAnimationFrame(stageReadyFrame.current);
+      stageReadyFrame.current = null;
+    };
   }, [image.path, initialData]);
-
-  useEffect(() => () => {
-    if (stageReadyFrame.current !== null) cancelAnimationFrame(stageReadyFrame.current);
-  }, []);
 
   const updateFit = useCallback((width: number, height: number) => {
     const viewport = viewportRef.current;
@@ -437,7 +424,9 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   }, [dimensions, updateFit]);
 
   const onImageLoad = (event: React.SyntheticEvent<HTMLImageElement>) => {
-    const { naturalWidth: width, naturalHeight: height } = event.currentTarget;
+    const picture = event.currentTarget;
+    if (!picture.isConnected) return;
+    const { naturalWidth: width, naturalHeight: height } = picture;
     setDimensions({ width, height });
     const canvas = maskRef.current;
     if (canvas) {
@@ -448,11 +437,12 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     setMaskDirty(false);
     updateFit(width, height);
     if (!stageReady) {
-      // Wait until the fitted dimensions have painted before enabling transform
-      // transitions; otherwise the first layout animates in from the raw size.
+      // Reveal only once the fitted dimensions are committed. A quick navigation must
+      // cancel both frames, or the previous image's callback can reveal the next too early.
+      if (stageReadyFrame.current !== null) cancelAnimationFrame(stageReadyFrame.current);
       stageReadyFrame.current = requestAnimationFrame(() => {
         stageReadyFrame.current = requestAnimationFrame(() => {
-          setStageReady(true);
+          if (picture.isConnected) setStageReady(true);
           stageReadyFrame.current = null;
         });
       });
@@ -670,7 +660,6 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   // The picture area only moves when the panels beside it open, close or resize, which the observer sees.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dockTab]);
-  useEffect(() => { if (stageReady) onShown?.(); }, [stageReady, onShown]);
 
 
   const replaceHandled = useRef(false);
@@ -1042,6 +1031,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     "editor.actualSize": actualSize,
     "editor.zoomIn": zoomIn,
     "editor.zoomOut": zoomOut,
+    "editor.keep": () => duplicate?.onToggle(),
   };
   const keyOf = (id: ShortcutId) => keys[id] ? keyLabel(keys[id]) : "";
 
@@ -1625,7 +1615,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
           <div className="file-heading">
             <strong title={savePath || image.name}>{displayName}</strong>
             <span className="file-details">
-              <span>{index + 1} of {total}</span>
+              <span>{index + 1} of {total}{duplicate ? " duplicates" : ""}</span>
               {!savePath && <span title="Save asks where to store this picture">{image.path ? `${image.extension.toUpperCase()} · saved as a new file` : "Not on disk"}</span>}
               {stageReady && <>
                 <span title="Current output resolution">{dimensions.width} × {dimensions.height} px</span>
@@ -1770,6 +1760,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       >
         {!imageData ? (slowLoad ? <div className="editor-loading"><span className="spinner" />Loading image</div> : null) : (
           <div
+            key={image.path}
             ref={stageRef}
             className={`image-stage ${stageReady ? "" : "initializing"}`}
             style={{
@@ -1829,6 +1820,11 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
 
 
         <div ref={cursorRef} className="brush-cursor" aria-hidden="true" />
+        {duplicate && <button className={`duplicate-verdict ${duplicate.keep ? "keep" : "drop"}`} aria-pressed={duplicate.keep}
+          onPointerDown={(event) => event.stopPropagation()} onClick={duplicate.onToggle}
+          title={`${duplicate.keep ? "Kept" : "Deleted"} when the group is resolved. Click${keyOf("editor.keep") ? ` or press ${keyOf("editor.keep")}` : ""} to ${duplicate.keep ? "delete" : "keep"} it.`}>
+          {duplicate.keep ? <><Check size={16} /> Keep</> : <><Trash2 size={16} /> Delete</>}
+        </button>}
         <button className={`nav-button previous ${total < 2 ? "gone" : ""}`} onClick={() => safeNavigate(-1)} disabled={total < 2 || working || saving} title="Previous image (Left arrow)"><ArrowLeft size={21} /></button>
         <button className={`nav-button strip ${stripOpen ? "active" : ""} ${total < 2 ? "gone" : ""}`} onClick={() => onStripToggle?.()} disabled={total < 2}
           aria-pressed={stripOpen} title={stripOpen ? "Hide the picture strip" : "Show the picture strip"}><LayoutGrid size={19} /></button>

@@ -6,6 +6,8 @@ import BrowserView, { type StoreView } from "./Browser";
 import Filmstrip, { type ViewportBox } from "./Filmstrip";
 import type { AlbumView } from "./Albums";
 import { taggedWith, type TagView } from "./Tags";
+import type { DuplicateGroupView, DuplicateLevel, DuplicateProgress, Duplicates, DuplicateView } from "./Duplicates";
+import { resolveDuplicateSelection, splitIgnoredDuplicateGroups, withoutDeletedDuplicates, type DuplicateDeletion } from "./duplicateActions";
 import { SettingsDialog, type SettingsTab } from "./Settings";
 import { FACE_SOURCE_PREFERENCE, usePreference } from "./preferences";
 import Editor, { type FaceSwapSource } from "./Editor";
@@ -43,6 +45,9 @@ const renamedTags = (tags: string[], name: string, leaf: string) => {
 // A picture is matched by its place in the store's ab/cd/name layout, so an album still finds it when
 // Immich writes the folders above it differently (another mount, another upload folder).
 const layoutKey = (path: string) => path.split("/").slice(-3).join("/");
+
+/** A picture tagged `location/outside` also carries `location`; only the whole names are carried over. */
+const leafTags = (tags: string[] | undefined) => (tags ?? []).filter((tag) => !tags?.some((other) => other !== tag && other.startsWith(`${tag}/`)));
 
 type LoadedImage = LoadRequest & { id: number };
 
@@ -101,6 +106,23 @@ export default function App() {
   const [tagError, setTagError] = useState("");
   // Which albums each picture is in, for the album mark on its card.
   const [albumsByPath, setAlbumsByPath] = useState<Record<string, string[]>>({});
+  // Duplicate pictures of the open store: the last search's groups, which picture of each is kept (the
+  // default, unless clicked otherwise), and groups the user said are not duplicates, by store.
+  const [duplicates, setDuplicates] = useState<Duplicates | null>(null);
+  const duplicateRequest = useRef(0);
+  const [duplicateProgress, setDuplicateProgress] = useState<DuplicateProgress | null>(null);
+  const [duplicateError, setDuplicateError] = useState("");
+  const [duplicateNotice, setDuplicateNotice] = useState("");
+  const [duplicateBusy, setDuplicateBusy] = useState(false);
+  const duplicateResolving = useRef(false);
+  const duplicateSearch = useRef<{ storeId: string; progress: DuplicateProgress; result: Duplicates | null; deleted: Set<string> } | null>(null);
+  const duplicateSearchErrors = useRef(new Map<string, string>());
+  const [keepChoices, setKeepChoices] = useState<Record<string, boolean>>({});
+  const [duplicateLevel, setDuplicateLevel] = usePreference<DuplicateLevel>("inpaint.duplicateLevel", "normal", (value) => ["close", "normal", "loose"].includes(value));
+  // Kept as `<store id>:<group key>`.
+  const [notDuplicates, setNotDuplicates] = usePreference<string[]>("inpaint.notDuplicates", [], (value) => value.every((entry) => typeof entry === "string"));
+  // The group the editor goes through instead of the gallery, by its key.
+  const [editorGroup, setEditorGroup] = useState<string | null>(null);
   // Only the newest album request counts; answers to earlier clicks are dropped.
   const albumRequest = useRef(0);
   const albumIdRef = useRef<string | null>(null);
@@ -186,12 +208,54 @@ export default function App() {
     return { shown: sorted, leftOut: inside.length - sorted.length };
   }, [images, albumPaths, tagFilter, tagsByPath, outside, order, facts, storeId, albumsByPath]);
 
+  // Each group's pictures still in the store, the one to keep first: the biggest, then one with tags or
+  // albums, then a favourite or the better rated, then the bigger file, then the older one.
+  const duplicateGroups = useMemo(() => {
+    if (!duplicates || !storeId) return [];
+    const byPath = new Map(images.map((image) => [image.path, image]));
+    const hidden = notDuplicates.filter((entry) => entry.startsWith(`${storeId}:`)).map((entry) => entry.slice(storeId.length + 1));
+    const labelled = (path: string) => (tagsByPath[path]?.length || albumsByPath[path]?.length ? 1 : 0);
+    const groups: DuplicateGroupView[] = [];
+    for (const group of splitIgnoredDuplicateGroups(duplicates.groups, hidden)) {
+      const key = group.pictures.map((picture) => picture.path).sort().join("\n");
+      const present = group.pictures.filter((picture) => {
+        const image = byPath.get(picture.path);
+        return image && image.size === picture.size && image.modifiedMs === picture.modifiedMs;
+      });
+      if (present.length < 2) continue;
+      const added = (path: string) => facts[path]?.addedMs ?? byPath.get(path)!.addedMs ?? byPath.get(path)!.modifiedMs;
+      const ranked = [...present].sort((a, b) => b.width * b.height - a.width * a.height
+        || labelled(b.path) - labelled(a.path)
+        || Number(!!facts[b.path]?.favorite) - Number(!!facts[a.path]?.favorite)
+        || (facts[b.path]?.rating ?? 0) - (facts[a.path]?.rating ?? 0)
+        || byPath.get(b.path)!.size - byPath.get(a.path)!.size
+        || added(a.path) - added(b.path));
+      groups.push({
+        key,
+        similarity: group.similarity,
+        members: ranked.map((picture, index) => ({
+          image: byPath.get(picture.path)!,
+          compared: picture,
+          width: picture.width,
+          height: picture.height,
+          tags: leafTags(tagsByPath[picture.path]),
+          albums: albumsByPath[picture.path] ?? [],
+          keep: keepChoices[picture.path] ?? index === 0,
+        })),
+      });
+    }
+    return groups;
+  }, [duplicates, storeId, images, notDuplicates, tagsByPath, albumsByPath, facts, keepChoices]);
+  const openGroup = editorGroup ? duplicateGroups.find((group) => group.key === editorGroup) ?? null : null;
+  // The editor goes through the open duplicate group, or else the gallery.
+  const editorList = useMemo(() => (openGroup ? openGroup.members.map((member) => member.image) : shown), [openGroup, shown]);
+
   // Pictures sent to the API's /load endpoint, opened outside the folder list.
   const [loaded, setLoaded] = useState<LoadedImage | null>(null);
   const [queuedLoad, setQueuedLoad] = useState<LoadedImage | null>(null);
   const loadCount = useRef(0);
   useServerBridge((request) => setQueuedLoad({ ...request, id: ++loadCount.current }));
-  const folderEditorOpen = editorIndex !== null && !!shown[editorIndex];
+  const folderEditorOpen = editorIndex !== null && !!editorList[editorIndex];
   useEffect(() => {
     // An open editor first asks about unsaved changes, then calls onReplace.
     if (!queuedLoad || loaded || folderEditorOpen) return;
@@ -393,17 +457,38 @@ export default function App() {
   }, [loadAlbums, loadAlbumMarks, selectAlbum]);
 
   useEffect(() => {
+    const searching = listen<DuplicateProgress & { storeId: string }>("duplicates-progress", ({ payload }) => {
+      if (duplicateSearch.current?.storeId !== payload.storeId) return;
+      duplicateSearch.current.progress = payload;
+      if (payload.storeId === openStoreId.current) setDuplicateProgress(payload);
+    });
+    const matches = listen<{ storeId: string; result: Duplicates }>("duplicates-results", ({ payload }) => {
+      if (duplicateSearch.current?.storeId !== payload.storeId) return;
+      const result = withoutDeletedDuplicates(payload.result, duplicateSearch.current.deleted);
+      duplicateSearch.current.result = result;
+      if (payload.storeId === openStoreId.current) setDuplicates(result);
+    });
     const reading = listen<{ id: string; done: number; total: number }>("tag-index", ({ payload }) => {
       if (payload.id === openStoreId.current) setTagProgress({ done: payload.done, total: payload.total });
     });
     const listening = listen<{ id: string; done: number; total: number }>("store-scan", ({ payload }) => {
-      if (payload.id === openStoreId.current && scanning.current.has(payload.id)) {
-        setStoreProgress({ done: payload.done, total: payload.total });
+      if (payload.id === openStoreId.current) {
+        if (scanning.current.has(payload.id)) setStoreProgress({ done: payload.done, total: payload.total });
+        setDuplicateProgress((current) => current?.stage === "scan" ? { stage: "scan", done: payload.done, total: payload.total } : current);
       }
+    });
+    const refreshed = listen<{ storeId: string; contents: StoreContents }>("store-index-updated", ({ payload }) => {
+      if (payload.storeId !== openStoreId.current) return;
+      setStoreStats(payload.contents.stats);
+      if (editorOpen.current) pendingScan.current = payload.contents;
+      else setImages(payload.contents.images);
     });
     return () => {
       void listening.then((unlisten) => unlisten());
       void reading.then((unlisten) => unlisten());
+      void searching.then((unlisten) => unlisten());
+      void matches.then((unlisten) => unlisten());
+      void refreshed.then((unlisten) => unlisten());
     };
   }, []);
 
@@ -619,7 +704,18 @@ export default function App() {
     setTagFilter("");
     setTagError("");
     setTagProgress(null);
+    const searching = duplicateSearch.current;
+    setDuplicates(searching?.storeId === storeId && searching.result ? withoutDeletedDuplicates(searching.result, searching.deleted) : null);
+    setDuplicateProgress(duplicateSearch.current?.storeId === storeId ? duplicateSearch.current.progress : null);
+    setDuplicateError(duplicateSearchErrors.current.get(storeId ?? "") ?? "");
+    setDuplicateNotice("");
+    setKeepChoices({});
+    const request = ++duplicateRequest.current;
     if (activeStore) {
+      const opened = activeStore.id;
+      if (duplicateSearch.current?.storeId !== opened) void invoke<Duplicates | null>("duplicates_cached", { storeId: opened })
+        .then((found) => { if (openStoreId.current === opened && duplicateRequest.current === request) setDuplicates(found); })
+        .catch(() => {});
       void loadAlbums(activeStore);
       void loadAlbumMarks(activeStore);
       void loadTags(activeStore, false);
@@ -755,6 +851,116 @@ export default function App() {
     if (tagFilter === name || tagFilter.startsWith(`${name}/`)) setTagFilter("");
   };
 
+  const searchDuplicates = async (store: Store) => {
+    if (duplicateSearch.current || duplicateResolving.current) {
+      setDuplicateError("A duplicate operation is already running. Return to its store to stop it.");
+      return;
+    }
+    ++duplicateRequest.current;
+    duplicateSearchErrors.current.delete(store.id);
+    setDuplicates(null);
+    setKeepChoices({});
+    setDuplicateError("");
+    setDuplicateNotice("");
+    setDuplicateProgress({ stage: "scan", done: 0, total: 0 });
+    const deleted = new Set<string>();
+    duplicateSearch.current = { storeId: store.id, progress: { stage: "scan", done: 0, total: 0 }, result: null, deleted };
+    try {
+      const found = await invoke<Duplicates>("duplicates_search", { storeId: store.id, level: duplicateLevel });
+      if (openStoreId.current !== store.id) return;
+      setDuplicates(withoutDeletedDuplicates(found, deleted));
+    } catch (error) {
+      // A notification can still be queued when the command ends. Load the persisted
+      // checkpoint as well, so Stop/error retains the most recent confirmed groups.
+      try {
+        const saved = await invoke<Duplicates | null>("duplicates_cached", { storeId: store.id });
+        if (openStoreId.current === store.id && saved) setDuplicates(withoutDeletedDuplicates(saved, deleted));
+      } catch { /* Keep the last live snapshot if the checkpoint cannot be read. */ }
+      duplicateSearchErrors.current.set(store.id, String(error));
+      if (openStoreId.current === store.id) setDuplicateError(String(error));
+    } finally {
+      duplicateSearch.current = null;
+      if (openStoreId.current === store.id) setDuplicateProgress(null);
+    }
+  };
+
+  const clearDuplicates = async (store: Store) => {
+    const request = ++duplicateRequest.current;
+    setDuplicateBusy(true);
+    setDuplicateError("");
+    try {
+      await invoke("duplicates_clear", { storeId: store.id });
+      if (openStoreId.current !== store.id || duplicateRequest.current !== request) return;
+      setDuplicates(null);
+      setKeepChoices({});
+      setDuplicateNotice("");
+      setEditorGroup(null);
+    } catch (error) {
+      if (openStoreId.current === store.id && duplicateRequest.current === request) setDuplicateError(String(error));
+    } finally {
+      setDuplicateBusy(false);
+    }
+  };
+
+  /** Deletes the pictures marked in these groups, once their tags and albums are on the ones kept. */
+  const resolveDuplicates = async (store: Store, groups: DuplicateGroupView[]) => {
+    if (duplicateResolving.current) return;
+    const doomed = groups.flatMap((group) => group.members.filter((member) => !member.keep).map((member) => member.image.path));
+    if (!doomed.length) return;
+    const whole = groups.filter((group) => group.members.every((member) => !member.keep)).length;
+    const question = `Delete ${doomed.length.toLocaleString()} ${doomed.length === 1 ? "picture" : "pictures"} from ${groups.length.toLocaleString()} ${groups.length === 1 ? "group" : "groups"}?`
+      + (whole ? ` ${whole.toLocaleString()} ${whole === 1 ? "group keeps" : "groups keep"} no picture at all.` : "")
+      + (store.immich ? " They go to Immich's trash." : " They go to the trash.");
+    duplicateResolving.current = true;
+    setDuplicateBusy(true);
+    setDuplicateError("");
+    setDuplicateNotice("");
+    try {
+      if (!await confirm(question, { title: "Delete duplicates", kind: "warning", okLabel: "Delete", cancelLabel: "Cancel" })) return;
+      const message = await resolveDuplicateSelection(store, groups, invoke, () => openStoreId.current === store.id,
+        (paths, checks) => deletePictures(paths, checks));
+      if (openStoreId.current === store.id) setDuplicateNotice(message);
+    } catch (error) {
+      if (openStoreId.current === store.id) setDuplicateError(String(error));
+    } finally {
+      duplicateResolving.current = false;
+      setDuplicateBusy(false);
+      if (openStoreId.current === store.id) {
+        void loadTags(store, true);
+        void loadAlbums(store);
+        void loadAlbumMarks(store, true);
+      }
+    }
+  };
+
+  const duplicateView: DuplicateView = {
+    result: duplicates,
+    groups: duplicateGroups,
+    progress: duplicateProgress,
+    error: duplicateError,
+    notice: duplicateNotice,
+    busy: duplicateBusy || !!storeProgress,
+    level: duplicateLevel,
+    ignored: storeId ? notDuplicates.filter((entry) => entry.startsWith(`${storeId}:`)).length : 0,
+    onLevel: setDuplicateLevel,
+    onSearch: () => { if (activeStore) void searchDuplicates(activeStore); },
+    onCancel: () => { if (activeStore) void invoke("duplicates_cancel", { storeId: activeStore.id }); },
+    onClear: () => { if (activeStore) void clearDuplicates(activeStore); },
+    onToggle: (path) => {
+      const member = duplicateGroups.flatMap((group) => group.members).find((entry) => entry.image.path === path);
+      if (member) setKeepChoices((current) => ({ ...current, [path]: !member.keep }));
+    },
+    onResolve: (groups) => { if (activeStore) void resolveDuplicates(activeStore, groups); },
+    onIgnore: (group) => { if (storeId) setNotDuplicates((current) => [...current, `${storeId}:${group.members.map((member) => member.image.path).sort().join("\n")}`]); },
+    onUnignore: () => { if (storeId) setNotDuplicates((current) => current.filter((entry) => !entry.startsWith(`${storeId}:`))); },
+    onOpen: (group, index) => {
+      editorOpen.current = true;
+      setEditorGroup(group.key);
+      setEditorIndex(index);
+    },
+    onNoticeClear: () => setDuplicateNotice(""),
+  };
+
   const albumView: AlbumView = {
     storeId: activeStore?.id ?? "",
     windowDrop,
@@ -774,20 +980,39 @@ export default function App() {
   };
 
   /** Deletes pictures from the gallery: Immich's trash inside a compatible store, the desktop's otherwise. */
-  const deletePictures = async (paths: string[]) => {
+  const deletePictures = async (paths: string[], checks?: Map<string, DuplicateDeletion>) => {
+    const deletingStore = openStoreId.current;
     const gone = new Set<string>();
     let refused = "";
     for (const path of paths) {
+      if (checks && openStoreId.current !== deletingStore) { refused = "The open store changed."; break; }
       try {
-        const result = await invoke<{ deleted: boolean; message: string }>("delete_image", { path, permanent: false });
-        if (result.deleted) gone.add(path);
+        const result = await invoke<{ deleted: boolean; message: string }>("delete_image", { path, permanent: false, ...checks?.get(path) });
+        if (result.deleted) {
+          gone.add(path);
+          const searching = duplicateSearch.current;
+          if (searching?.storeId === deletingStore) {
+            searching.deleted.add(path);
+          }
+        }
         else refused = refused || result.message;
+        if (checks && !result.deleted) break;
       } catch (error) {
         refused = refused || String(error);
+        if (checks) break;
       }
     }
-    if (gone.size) {
+    const searching = duplicateSearch.current;
+    if (searching?.storeId === deletingStore && searching.result && gone.size) {
+      searching.result = withoutDeletedDuplicates(searching.result, searching.deleted);
+    }
+    if (gone.size && openStoreId.current === deletingStore) {
       const removed = images.filter((image) => gone.has(image.path));
+      setDuplicates((current) => current && {
+        ...current,
+        groups: current.groups.map((group) => ({ ...group, pictures: group.pictures.filter((picture) => !gone.has(picture.path)) }))
+          .filter((group) => group.pictures.length > 1),
+      });
       setImages((current) => current.filter((image) => !gone.has(image.path)));
       pendingAdded.current = pendingAdded.current.filter((image) => !gone.has(image.path));
       if (pendingScan.current) pendingScan.current = { ...pendingScan.current, images: pendingScan.current.images.filter((image) => !gone.has(image.path)) };
@@ -806,26 +1031,25 @@ export default function App() {
     return kept ? `${gone.size.toLocaleString()} deleted, ${kept.toLocaleString()} kept: ${refused}` : `${gone.size.toLocaleString()} ${gone.size === 1 ? "picture" : "pictures"} deleted.`;
   };
 
-  // The editor is built anew for each picture. The strip lives here so it stays put, and the picture
-  // that was open is held over the new one until that has painted, then fades out.
+  // The editor and strip stay mounted while switching pictures, keeping their panels in place.
   const [stripOpen, setStripOpen] = usePreference("inpaint.filmstrip", false);
   const [viewportBox, setViewportBox] = useState<ViewportBox | null>(null);
   const [editorBusy, setEditorBusy] = useState(false);
   const editorNavigator = useRef<((index: number) => void) | null>(null);
-  const [leaving, setLeaving] = useState<{ src: string; rect: DOMRect; fading: boolean } | null>(null);
-  const pictureLeaving = useCallback((snapshot: { src: string; rect: DOMRect }) => setLeaving({ ...snapshot, fading: false }), []);
-  const pictureShown = useCallback(() => setLeaving((current) => current && { ...current, fading: true }), []);
+
+  // A group whose copies were deleted or hidden elsewhere leaves nothing to go through.
   useEffect(() => {
-    if (!leaving) return;
-    // Gone once faded, or after a while if the next picture never paints.
-    const done = window.setTimeout(() => setLeaving(null), leaving.fading ? 280 : 1500);
-    return () => window.clearTimeout(done);
-  }, [leaving]);
+    if (!editorGroup || openGroup) return;
+    setEditorGroup(null);
+    setEditorIndex(null);
+    void refreshAfterEdit();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editorGroup, openGroup]);
 
   const navigate = (offset: number) => {
     setEditorIndex((current) => {
-      if (current === null || !shown.length) return current;
-      return (current + offset + shown.length) % shown.length;
+      if (current === null || !editorList.length) return current;
+      return (current + offset + editorList.length) % editorList.length;
     });
   };
 
@@ -839,10 +1063,11 @@ export default function App() {
     immichStores: stores.filter((store) => store.immich),
     // After deleting, the editor moves on to the next picture, or back to the gallery after the last one.
     onDeleted: (path: string) => {
-      const index = shown.findIndex((image) => image.path === path);
-      const removed = shown[index];
+      const index = editorList.findIndex((image) => image.path === path);
+      const removed = editorList[index];
       const withoutPath = (list: ImageEntry[]) => list.filter((image) => image.path !== path);
-      const remaining = withoutPath(shown);
+      // A duplicate group of one picture is no group any more, so the editor closes with it.
+      const remaining = openGroup && editorList.length <= 2 ? [] : withoutPath(editorList);
       setImages(withoutPath(images));
       savedPaths.current.delete(path);
       pendingAdded.current = withoutPath(pendingAdded.current);
@@ -851,6 +1076,7 @@ export default function App() {
       if (loaded || index < 0 || !remaining.length) {
         setLoaded(null);
         setEditorIndex(null);
+        setEditorGroup(null);
         void refreshAfterEdit();
       } else {
         setEditorIndex(Math.min(index, remaining.length - 1));
@@ -888,18 +1114,22 @@ export default function App() {
     );
   }
 
-  if (editorIndex !== null && shown[editorIndex]) {
+  if (editorIndex !== null && editorList[editorIndex]) {
+    const current = editorList[editorIndex];
+    const member = openGroup?.members.find((entry) => entry.image.path === current.path);
     return (
       <>
       <Editor
         {...editorProps}
         // One editor for the whole gallery: it opens each picture itself, keeping its panels in place.
         key="gallery-editor"
-        image={shown[editorIndex]}
+        image={current}
         index={editorIndex}
-        total={shown.length}
+        total={editorList.length}
+        duplicate={member && { keep: member.keep, onToggle: () => duplicateView.onToggle(member.image.path) }}
         onExit={() => {
           setEditorIndex(null);
+          setEditorGroup(null);
           void refreshAfterEdit();
           // Favourites and ratings may have changed in the editor.
           void loadFacts(openStoreId.current, openStoreId.current ? null : currentPath, true);
@@ -910,13 +1140,10 @@ export default function App() {
         onViewport={setViewportBox}
         onBusy={setEditorBusy}
         navigator={editorNavigator}
-        onLeaving={pictureLeaving}
-        onShown={pictureShown}
       />
-      {stripOpen && shown.length > 1 && viewportBox && <Filmstrip pictures={shown} index={editorIndex} box={viewportBox} disabled={editorBusy}
+      {stripOpen && editorList.length > 1 && viewportBox && <Filmstrip pictures={editorList} index={editorIndex} box={viewportBox} disabled={editorBusy}
+        keeps={openGroup ? Object.fromEntries(openGroup.members.map((entry) => [entry.image.path, entry.keep])) : undefined}
         onJump={(target) => editorNavigator.current?.(target)} />}
-      {leaving && <img className={`picture-leaving ${leaving.fading ? "fading" : ""}`} src={leaving.src} alt="" draggable={false} decoding="sync"
-        style={{ left: leaving.rect.left, top: leaving.rect.top, width: leaving.rect.width, height: leaving.rect.height }} />}
       {settingsDialog}
       </>
     );
@@ -932,6 +1159,7 @@ export default function App() {
     dropMessage,
     onDropMessageClear: () => setDropMessage(""),
     tags: tagView,
+    duplicates: duplicateView,
     stats: storeStats,
     progress: storeProgress,
     error: storeError,

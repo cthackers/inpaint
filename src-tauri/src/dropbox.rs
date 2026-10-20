@@ -29,6 +29,7 @@ use std::{
     io::{self, Read},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command,
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -65,6 +66,8 @@ pub struct DropboxSettings {
     pub monitor: String,
     /// The album each store's dropped pictures join, by store id; a store without one adds to none.
     pub albums: BTreeMap<String, String>,
+    /// Remove imported metadata before hashing/saving/uploading, independently for each store.
+    pub clear_metadata: BTreeMap<String, bool>,
 }
 
 impl Default for DropboxSettings {
@@ -79,6 +82,7 @@ impl Default for DropboxSettings {
             opacity: 0.2,
             monitor: "middle".into(),
             albums: BTreeMap::new(),
+            clear_metadata: BTreeMap::new(),
         }
     }
 }
@@ -195,6 +199,13 @@ impl NativeDrop {
 enum Outcome {
     Saved(Option<ImageEntry>, Placed),
     Duplicate(Placed),
+    MetadataKept(Box<Outcome>),
+}
+
+impl Outcome {
+    fn base(&self) -> &Self {
+        match self { Self::MetadataKept(outcome) => outcome.base(), _ => self }
+    }
 }
 
 /// Where a saved picture ended up, so the drop box can add it to the store's album.
@@ -619,6 +630,22 @@ fn fill_menu(menu: &gtk::Menu, app: &AppHandle) {
         menu.append(&item);
     }
     menu.append(&gtk::SeparatorMenuItem::new());
+    let current = settings(app);
+    let clear = gtk::CheckMenuItem::with_label("Clear metadata");
+    clear.set_sensitive(!current.store_id.is_empty());
+    clear.set_active(current.clear_metadata.get(&current.store_id).copied().unwrap_or(false));
+    let clear_app = app.clone();
+    clear.connect_toggled(move |item| {
+        let id = current.store_id.clone();
+        let enabled = item.is_active();
+        later(&clear_app, Box::new(move |app| {
+            report_error(app, update(app, |settings| {
+                if enabled { settings.clear_metadata.insert(id, true); }
+                else { settings.clear_metadata.remove(&id); }
+            }));
+        }));
+    });
+    menu.append(&clear);
     let pinned = gtk::CheckMenuItem::with_label("Always visible");
     pinned.set_active(info.pinned);
     let pin_app = app.clone();
@@ -811,9 +838,12 @@ fn process(app: &AppHandle, items: Vec<Item>) {
 /// `store-added` for each new picture and `album-added` for everything the album gained, including
 /// pictures the store already had.
 fn save_into<R: tauri::Runtime>(app: &AppHandle<R>, store: &Store, album: &str, items: Vec<Item>) -> Vec<Result<Outcome, String>> {
+    // Capture the destination store's policy once for the whole drop, including main-window drops.
+    let clear_metadata = app.try_state::<DropboxState>().is_some_and(|state|
+        state.settings.lock().unwrap().clear_metadata.get(&store.id).copied().unwrap_or(false));
     let mut results = Vec::new();
     for item in items {
-        save_item(store, item, &mut results);
+        save_item(store, item, clear_metadata, &mut results);
     }
     let joined = match add_to_album(store, album, &results) {
         Ok(()) => !album.is_empty(),
@@ -824,7 +854,7 @@ fn save_into<R: tauri::Runtime>(app: &AppHandle<R>, store: &Store, album: &str, 
     };
     let mut album_paths = Vec::new();
     for result in &results {
-        match result {
+        match result.as_ref().map(Outcome::base) {
             Ok(Outcome::Saved(image, placed)) => {
                 if let Some(image) = image {
                     let _ = app.emit_to("main", "store-added", serde_json::json!({ "storeId": store.id, "image": image }));
@@ -957,9 +987,9 @@ fn add_to_album(store: &Store, album: &str, results: &[Result<Outcome, String>])
     if album.is_empty() {
         return Ok(());
     }
-    let placed = results.iter().filter_map(|result| match result {
+    let placed = results.iter().filter_map(|result| match result.as_ref().map(Outcome::base) {
         Ok(Outcome::Saved(_, placed) | Outcome::Duplicate(placed)) => Some(placed),
-        Err(_) => None,
+        _ => None,
     });
     if store.immich {
         let assets: Vec<String> = placed.filter_map(|placed| match placed { Placed::Asset(id) => Some(id.clone()), Placed::File(_) => None }).collect();
@@ -973,8 +1003,9 @@ fn add_to_album(store: &Store, album: &str, results: &[Result<Outcome, String>])
 }
 
 fn summarize(results: &[Result<Outcome, String>], store: &str) -> DropReport {
-    let saved = results.iter().filter(|result| matches!(result, Ok(Outcome::Saved(..)))).count();
-    let duplicates = results.iter().filter(|result| matches!(result, Ok(Outcome::Duplicate(_)))).count();
+    let saved = results.iter().filter(|result| matches!(result.as_ref().map(Outcome::base), Ok(Outcome::Saved(..)))).count();
+    let duplicates = results.iter().filter(|result| matches!(result.as_ref().map(Outcome::base), Ok(Outcome::Duplicate(_)))).count();
+    let metadata_kept = results.iter().filter(|result| matches!(result, Ok(Outcome::MetadataKept(_)))).count();
     let failure = results.iter().find_map(|result| result.as_ref().err());
     let mut parts = Vec::new();
     match saved {
@@ -988,6 +1019,9 @@ fn summarize(results: &[Result<Outcome, String>], store: &str) -> DropReport {
         count => parts.push(format!("{count} already in the store")),
     }
     parts.extend(failure.cloned());
+    if metadata_kept > 0 {
+        parts.push(format!("Metadata cleanup failed for {metadata_kept}; original picture{} kept", if metadata_kept == 1 { "" } else { "s" }));
+    }
     let outcome = if failure.is_some() { "failed" } else if saved > 0 { "saved" } else { "duplicate" };
     DropReport { outcome, message: parts.join(" · ") }
 }
@@ -1022,34 +1056,34 @@ fn desktop_folder() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Desktop"))
 }
 
-fn save_item(store: &Store, item: Item, results: &mut Vec<Result<Outcome, String>>) {
+fn save_item(store: &Store, item: Item, clear_metadata: bool, results: &mut Vec<Result<Outcome, String>>) {
     match item {
-        Item::File(path) => results.push(save_local_file(store, &path)),
-        Item::Url { url, page_images } => results.push(save_url(store, &url, &page_images, 0)),
+        Item::File(path) => results.push(save_local_file(store, &path, clear_metadata)),
+        Item::Url { url, page_images } => results.push(save_url(store, &url, &page_images, 0, clear_metadata)),
         Item::Bytes { data, name, mime } => {
-            results.push(stage_bytes(store, &data, &name, &mime).and_then(|staged| store_file(store, staged)))
+            results.push(stage_bytes(store, &data, &name, &mime).and_then(|staged| store_file(store, staged, clear_metadata)))
         }
         Item::Text { text, html } => {
             for url in urls_in_text(&text, html) {
-                results.push(save_url(store, &url, &[], 0));
+                results.push(save_url(store, &url, &[], 0, clear_metadata));
             }
         }
     }
 }
 
-fn save_local_file(store: &Store, path: &Path) -> Result<Outcome, String> {
+fn save_local_file(store: &Store, path: &Path, clear_metadata: bool) -> Result<Outcome, String> {
     let metadata = fs::metadata(path).map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!("{} is not a file.", path.display()));
     }
     let extension = extension_for(&read_head(path), "", &path.to_string_lossy(), true);
-    store_file(store, Staged { path: path.to_path_buf(), temp: None, extension, modified: metadata.modified().unwrap_or_else(|_| SystemTime::now()) })
+    store_file(store, Staged { path: path.to_path_buf(), temp: None, extension, modified: metadata.modified().unwrap_or_else(|_| SystemTime::now()) }, clear_metadata)
 }
 
-fn save_url(store: &Store, url: &str, page_images: &[String], depth: u8) -> Result<Outcome, String> {
+fn save_url(store: &Store, url: &str, page_images: &[String], depth: u8, clear_metadata: bool) -> Result<Outcome, String> {
     if let Some(rest) = url.strip_prefix("data:") {
         let (data, mime) = decode_data_url(rest)?;
-        return stage_bytes(store, &data, "", &mime).and_then(|staged| store_file(store, staged));
+        return stage_bytes(store, &data, "", &mime).and_then(|staged| store_file(store, staged, clear_metadata));
     }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(format!("Cannot save {} links.", url.split(':').next().unwrap_or(url)));
@@ -1061,11 +1095,11 @@ fn save_url(store: &Store, url: &str, page_images: &[String], depth: u8) -> Resu
         let _ = fs::File::open(&staged.path).and_then(|file| file.take(4 << 20).read_to_end(&mut html));
         let page = String::from_utf8_lossy(&html);
         return match page_images.first().cloned().or_else(|| image_in_page(url, &page)) {
-            Some(image) if depth == 0 => save_url(store, &image, &[], 1),
+            Some(image) if depth == 0 => save_url(store, &image, &[], 1, clear_metadata),
             _ => Err(format!("{url} is a page without a picture.")),
         };
     }
-    store_file(store, staged)
+    store_file(store, staged, clear_metadata)
 }
 
 /// Temporary files sit in the store folder, so saving is a rename; Immich uploads use the temp dir.
@@ -1098,10 +1132,41 @@ fn download(store: &Store, url: &str) -> Result<(Staged, String), String> {
     Ok((Staged { path: temp.to_path_buf(), temp: Some(temp), extension, modified: SystemTime::now() }, content_type))
 }
 
-fn store_file(store: &Store, staged: Staged) -> Result<Outcome, String> {
+/// ExifTool edits metadata without re-encoding pixels or flattening animation. Never edit a
+/// source file in place. A failed cleanup leaves the original available for saving as-is.
+fn strip_metadata(store: &Store, staged: &Staged) -> Result<Staged, String> {
+    let temp = temp_file(store)?;
+    fs::copy(&staged.path, &temp).map_err(|error| format!("Cannot prepare a copy for metadata cleanup: {error}"))?;
+    let result = Command::new("exiftool")
+        // TIFF keeps its primary image directory; remove descriptive tags there explicitly.
+        .args(["-overwrite_original", "-all=", "-CommonIFD0=", "-Trailer:All=", "-tagsFromFile", "@", "-IFD0:Orientation", "-ColorSpaceTags", "--"])
+        .arg(&temp)
+        .output()
+        .map_err(|error| format!("Cannot clear metadata: {error}. Install ExifTool to use Clear metadata."))?;
+    if !result.status.success() {
+        return Err(format!("Cannot clear metadata: {}", String::from_utf8_lossy(&result.stderr).trim()));
+    }
+    Ok(Staged { path: temp.to_path_buf(), temp: Some(temp), extension: staged.extension.clone(), modified: SystemTime::now() })
+}
+
+fn store_file(store: &Store, staged: Staged, clear_metadata: bool) -> Result<Outcome, String> {
     if !PICTURE_EXTENSIONS.contains(&staged.extension.as_str()) {
         return Err(format!("Only pictures can be saved, not .{} files.", staged.extension));
     }
+    let (staged, metadata_kept) = if clear_metadata {
+        match strip_metadata(store, &staged) {
+            Ok(cleaned) => (cleaned, false),
+            Err(error) => {
+                eprintln!("{error} Saving the original picture unchanged.");
+                (staged, true)
+            }
+        }
+    } else { (staged, false) };
+    store_prepared_file(store, staged).map(|outcome|
+        if metadata_kept { Outcome::MetadataKept(Box::new(outcome)) } else { outcome })
+}
+
+fn store_prepared_file(store: &Store, staged: Staged) -> Result<Outcome, String> {
     let sha1 = sha1_file(&staged.path)?;
     let name = format!("{sha1}.{}", staged.extension);
     if store.immich {
@@ -1346,6 +1411,160 @@ mod tests {
         Store { id: "test".into(), name: "Test".into(), path: super::super::path_string(root), immich: false, ..Default::default() }
     }
 
+    fn annotated_picture(folder: &Path, extension: &str, format: image::ImageFormat) -> PathBuf {
+        let path = folder.join(format!("annotated.{extension}"));
+        let bytes = super::super::encode_image(&image::DynamicImage::new_rgb8(8, 6), format).unwrap();
+        fs::write(&path, bytes).unwrap();
+        let output = Command::new("exiftool").args(["-overwrite_original", "-XMP-dc:Subject=Web/Imported", "-XMP-xmp:Rating=5",
+            "-XMP-dc:Description=Unwanted notes", "-EXIF:Artist=Web Artist", "-EXIF:DateTimeOriginal=2020:01:02 03:04:05",
+            "-IFD0:Rating=4", "-IFD0:XPKeywords=Web/Legacy", "-IFD0:ImageDescription=Imported description", "-IFD0:Orientation#=6"])
+            .arg(&path).output().expect("Install ExifTool to run metadata tests");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        path
+    }
+
+    fn embedded_metadata(path: &Path) -> serde_json::Value {
+        let output = Command::new("exiftool").args(["-j", "-n", "-s"]).arg(path).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()[0].clone()
+    }
+
+    #[test]
+    fn metadata_policy_defaults_off_and_round_trips_per_store() {
+        let old: DropboxSettings = serde_json::from_value(serde_json::json!({"albums": {"first": "album"}})).unwrap();
+        assert!(old.clear_metadata.is_empty());
+        let mut settings = old;
+        settings.clear_metadata.insert("first".into(), true);
+        settings.clear_metadata.insert("second".into(), false);
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["clearMetadata"]["first"], true);
+        let loaded: DropboxSettings = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    #[ignore = "requires ExifTool"]
+    fn clears_imported_metadata_before_hashing_without_changing_source_or_pixels() {
+        for (extension, format) in [("jpg", image::ImageFormat::Jpeg), ("png", image::ImageFormat::Png), ("webp", image::ImageFormat::WebP), ("tif", image::ImageFormat::Tiff)] {
+            let root = tempfile::tempdir().unwrap();
+            let store = folder_store(root.path());
+            let source = annotated_picture(root.path(), extension, format);
+            let original = fs::read(&source).unwrap();
+            let result = save_local_file(&store, &source, true).unwrap();
+            let Outcome::Saved(_, Placed::File(saved)) = result else { panic!("cleanup should succeed for {extension}") };
+            let tags = embedded_metadata(&saved);
+            for key in ["Subject", "Rating", "Description", "Artist", "DateTimeOriginal", "XPKeywords", "ImageDescription"] {
+                assert!(tags.get(key).is_none(), "{extension} retained {key}: {tags}");
+            }
+            assert_eq!(tags["Orientation"], 6, "orientation must survive without preserving other EXIF");
+            assert_eq!(fs::read(&source).unwrap(), original);
+            assert_eq!(image::load_from_memory(&original).unwrap().to_rgba8(), image::open(&saved).unwrap().to_rgba8());
+            assert_eq!(saved.file_stem().unwrap().to_str().unwrap(), sha1_file(&saved).unwrap());
+            assert!(matches!(save_local_file(&store, &source, true), Ok(Outcome::Duplicate(_))));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ExifTool"]
+    fn cleanup_failures_save_the_original_and_report_success_with_a_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let store = folder_store(root.path());
+        // Simulate a format that the cleaner cannot process, but the drop box accepts as-is.
+        let source = root.path().join("unsupported.heic");
+        fs::write(&source, b"original bytes with metadata").unwrap();
+        let result = save_local_file(&store, &source, true).unwrap();
+        assert!(matches!(&result, Outcome::MetadataKept(_)));
+        let Outcome::Saved(_, Placed::File(saved)) = result.base() else { panic!("original should still be saved") };
+        assert_eq!(fs::read(saved).unwrap(), fs::read(&source).unwrap());
+        let report = summarize(&[Ok(result)], "Test");
+        assert_eq!(report.outcome, "saved");
+        assert!(report.message.contains("Metadata cleanup failed"));
+        assert!(fs::read_dir(root.path()).unwrap().flatten().all(|entry| !entry.file_name().to_string_lossy().starts_with(".inpaint-drop-")));
+    }
+
+    #[test]
+    #[ignore = "requires ExifTool"]
+    fn destination_store_policy_applies_to_files_bytes_and_data_urls() {
+        let root = tempfile::tempdir().unwrap();
+        let source = annotated_picture(root.path(), "png", image::ImageFormat::Png);
+        let original = fs::read(&source).unwrap();
+        let app = tauri::test::mock_app();
+        let state = DropboxState::default();
+        state.settings.lock().unwrap().clear_metadata.insert("clean".into(), true);
+        app.manage(state);
+        for clean in [true, false] {
+            let folder = tempfile::tempdir().unwrap();
+            let mut store = folder_store(folder.path());
+            store.id = if clean { "clean" } else { "keep" }.into();
+            let items = vec![Item::File(source.clone()), Item::Bytes { data: original.clone(), name: "drop.png".into(), mime: "image/png".into() },
+                Item::Url { url: format!("data:image/png;base64,{}", BASE64.encode(&original)), page_images: vec![] }];
+            let results = save_into(app.handle(), &store, "", items);
+            let Ok(Outcome::Saved(_, Placed::File(saved))) = &results[0] else { panic!("expected a saved picture") };
+            assert!(matches!(results[1], Ok(Outcome::Duplicate(_))));
+            assert!(matches!(results[2], Ok(Outcome::Duplicate(_))));
+            if clean { assert!(embedded_metadata(saved).get("Subject").is_none()); }
+            else { assert_eq!(fs::read(saved).unwrap(), original); }
+        }
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    #[test]
+    #[ignore = "requires ExifTool"]
+    fn metadata_cleanup_preserves_animation_frames() {
+        use image::AnimationDecoder;
+        let root = tempfile::tempdir().unwrap();
+        let store = folder_store(root.path());
+        let source = root.path().join("animation.gif");
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(fs::File::create(&source).unwrap());
+            encoder.set_repeat(image::codecs::gif::Repeat::Infinite).unwrap();
+            encoder.encode_frames([image::Rgba([255, 0, 0, 255]), image::Rgba([0, 0, 255, 255])].into_iter()
+                .map(|colour| image::Frame::new(image::RgbaImage::from_pixel(8, 6, colour)))).unwrap();
+        }
+        let output = Command::new("exiftool").args(["-overwrite_original", "-Comment=Unwanted notes"]).arg(&source).output().unwrap();
+        assert!(output.status.success());
+        let original = fs::read(&source).unwrap();
+        let result = save_local_file(&store, &source, true).unwrap();
+        let Outcome::Saved(_, Placed::File(saved)) = result else { panic!("expected a cleaned GIF") };
+        let frames = |data| image::codecs::gif::GifDecoder::new(std::io::Cursor::new(data)).unwrap().into_frames().collect_frames().unwrap();
+        let before = frames(original);
+        let after = frames(fs::read(&saved).unwrap());
+        assert_eq!(after.len(), 2);
+        for (before, after) in before.iter().zip(&after) { assert_eq!(before.buffer(), after.buffer()); }
+        assert!(embedded_metadata(&saved).get("Comment").is_none());
+    }
+
+    #[test]
+    #[ignore = "requires ExifTool"]
+    fn immich_receives_cleaned_bytes_and_checksum_or_the_original_on_cleanup_failure() {
+        use super::super::http::test_server::{answer, serve};
+        let root = tempfile::tempdir().unwrap();
+        let tagged = annotated_picture(root.path(), "png", image::ImageFormat::Png);
+        let unsupported = root.path().join("unsupported.heic");
+        fs::write(&unsupported, b"original unsupported bytes").unwrap();
+        for (source, clear) in [(&tagged, true), (&tagged, false), (&unsupported, true)] {
+            let (base, server) = serve(vec![answer("200 OK", &[], br#"{"id":"11111111-1111-1111-1111-111111111111","status":"duplicate"}"#)]);
+            let store = Store { immich: true, immich_url: base, immich_key: "test-key".into(), ..folder_store(root.path()) };
+            let original = fs::read(source).unwrap();
+            let expected = if clear && source == &tagged {
+                let staged = stage_bytes(&store, &original, "picture.png", "image/png").unwrap();
+                let cleaned = strip_metadata(&store, &staged).unwrap();
+                fs::read(&cleaned.path).unwrap()
+            } else { original.clone() };
+            let outcome = save_local_file(&store, source, clear).unwrap();
+            assert!(matches!(outcome.base(), Outcome::Duplicate(Placed::Asset(_))));
+            assert_eq!(matches!(outcome, Outcome::MetadataKept(_)), source == &unsupported);
+            let requests = server.join().unwrap();
+            let request = &requests[0];
+            assert!(request.starts_with("POST /api/assets "));
+            let checksum = sha1_smol::Sha1::from(&expected).digest().to_string();
+            assert!(request.to_ascii_lowercase().contains(&format!("x-immich-checksum: {checksum}")));
+            assert!(request.contains(&String::from_utf8_lossy(&expected).into_owned()));
+            assert_eq!(request.contains("Web/Imported"), !clear && source == &tagged);
+            assert_eq!(fs::read(source).unwrap(), original);
+        }
+    }
+
     #[test]
     fn extensions_prefer_names_for_files_and_content_for_downloads() {
         let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
@@ -1364,7 +1583,7 @@ mod tests {
         let album = super::super::albums::album_create(store.id.clone(), "From the drop box".into(), String::new()).unwrap();
         let source = root.path().join("new.png");
         fs::write(&source, b"dropped picture").unwrap();
-        let results = vec![save_local_file(&store, &source), save_local_file(&store, &source)];
+        let results = vec![save_local_file(&store, &source, false), save_local_file(&store, &source, false)];
         assert!(matches!(results[1], Ok(Outcome::Duplicate(_))), "the second drop finds the first");
         add_to_album(&store, &album.id, &results).unwrap();
         let pictures = super::super::albums::album_pictures(album.id.clone()).unwrap();
@@ -1382,20 +1601,20 @@ mod tests {
         let source = root.path().join("source.JPG");
         fs::write(&source, b"picture bytes").unwrap();
         let sha1 = sha1_smol::Sha1::from(b"picture bytes").digest().to_string();
-        assert!(matches!(save_local_file(&store, &source), Ok(Outcome::Saved(..))));
+        assert!(matches!(save_local_file(&store, &source, false), Ok(Outcome::Saved(..))));
         let saved = root.path().join(&sha1[..2]).join(&sha1[2..4]).join(format!("{sha1}.jpg"));
         assert_eq!(fs::read(&saved).unwrap(), b"picture bytes");
         assert_eq!(fs::metadata(&saved).unwrap().permissions().mode() & 0o777, 0o644);
         // Same content under another name or extension, or as bytes, is a duplicate.
         let copy = root.path().join("copy.png");
         fs::copy(&source, &copy).unwrap();
-        assert!(matches!(save_local_file(&store, &copy), Ok(Outcome::Duplicate(Placed::File(_)))));
+        assert!(matches!(save_local_file(&store, &copy, false), Ok(Outcome::Duplicate(Placed::File(_)))));
         let staged = stage_bytes(&store, b"picture bytes", "drop.webp", "image/webp").unwrap();
-        assert!(matches!(store_file(&store, staged), Ok(Outcome::Duplicate(_))));
+        assert!(matches!(store_file(&store, staged, false), Ok(Outcome::Duplicate(_))));
         let staged = stage_bytes(&store, b"other bytes", "notes.txt", "text/plain").unwrap();
-        assert!(matches!(store_file(&store, staged), Err(message) if message.contains(".txt")));
+        assert!(matches!(store_file(&store, staged, false), Err(message) if message.contains(".txt")));
         let staged = stage_bytes(&store, b"other bytes", "photo.heic", "").unwrap();
-        assert!(matches!(store_file(&store, staged), Ok(Outcome::Saved(None, _))));
+        assert!(matches!(store_file(&store, staged, false), Ok(Outcome::Saved(None, _))));
         let leftovers = fs::read_dir(root.path()).unwrap().flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with(".inpaint-drop-")).count();
         assert_eq!(leftovers, 0);
     }
@@ -1435,7 +1654,7 @@ mod tests {
         let png = image::DynamicImage::new_rgb8(2, 2);
         let bytes = super::super::encode_image(&png, image::ImageFormat::Png).unwrap();
         let staged = stage_bytes(&store, &bytes, "", "").unwrap();
-        let Ok(Outcome::Saved(Some(entry), _)) = store_file(&store, staged) else { panic!("expected a picture entry") };
+        let Ok(Outcome::Saved(Some(entry), _)) = store_file(&store, staged, false) else { panic!("expected a picture entry") };
         assert_eq!(entry.extension, "png");
         assert!(entry.name.len() == 44 && entry.path.starts_with(&store.path));
     }
