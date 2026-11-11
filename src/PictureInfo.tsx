@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Heart, Images, LoaderCircle, Star, Tag as TagIcon, UserRound, X } from "lucide-react";
 import { ChipPicker, Section, type Option } from "./ImmichPanel";
 import type { Album } from "./types";
+import PictureFileActions from "./PictureFileActions";
 
 type Label = { id: string; kind: "tag" | "person"; name: string; count: number };
 type Details = {
@@ -125,7 +126,6 @@ export default function PictureInfo({ path, onClose }: { path: string; onClose: 
   const peopleOptions = (labels ?? []).filter((label) => label.kind === "person").map(option);
   const albumOptions: Option[] = albums.map((album) => ({ id: album.id, label: album.fullName || album.name, hint: album.total ? `${album.total}` : undefined }));
   const facts = ([
-    ["File", details.name],
     ["Taken", details.taken],
     ["Camera", [details.make, details.model].filter(Boolean).join(" ")],
     ["Lens", details.lens],
@@ -185,6 +185,7 @@ export default function PictureInfo({ path, onClose }: { path: string; onClose: 
 
       <Section title="Details">
         <dl className="immich-details">
+          <dt>File</dt><dd><PictureFileActions key={path} path={path} name={details.name} /></dd>
           {facts.map(([label, value]) => <div key={label} style={{ display: "contents" }}><dt>{label}</dt><dd>{value}</dd></div>)}
         </dl>
       </Section>

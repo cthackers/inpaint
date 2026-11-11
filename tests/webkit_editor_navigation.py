@@ -1,6 +1,7 @@
 """Run the editor navigation regression in WebKitGTK using synthetic images.
 
 xvfb-run -a /usr/bin/python3 tests/webkit_editor_navigation.py [previous/Editor.tsx]
+Set INPAINT_EDITOR_TEST=tests/editorFacePreviews.tsx to run face-preview regressions.
 Requires PyGObject and WebKit2 4.1, plus the project's npm dependencies.
 """
 import os
@@ -25,7 +26,7 @@ const plugins = previous ? [{name:'previous-editor', setup(build) {
         contents:readFileSync(previous, 'utf8'), loader:'tsx', resolveDir:resolve('src')
     }));
 }}] : [];
-const result = await build({entryPoints:['tests/editorNavigation.tsx'], bundle:true,
+const result = await build({entryPoints:[process.env.INPAINT_EDITOR_TEST || 'tests/editorNavigation.tsx'], bundle:true,
     write:false, format:'iife', plugins, define:{'process.env.NODE_ENV':'"production"'}});
 process.stdout.write(result.outputFiles[0].text);
 """

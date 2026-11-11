@@ -31,6 +31,9 @@ class WorkerCacheTests(unittest.TestCase):
             patch.object(inpaint.sys, "stdin", stream),
             patch.object(inpaint.sys, "stdout", output),
             patch.object(inpaint, "configure_cache"),
+            patch("worker_protocol.configure_worker_output"),
+            patch("worker_protocol.emit", side_effect=lambda message: output.write(json.dumps(message) + "\n")),
+            patch("downloads.install_hooks"),
             patch.object(inpaint, "release_memory") as release,
             patch.object(inpaint, "load_model", side_effect=load_model or (lambda _: object())) as models,
             patch.object(inpaint, "load_plugin", side_effect=lambda name, option: (object(), name)) as plugins,
@@ -95,6 +98,16 @@ class WorkerCacheTests(unittest.TestCase):
         )
         self.assertEqual(len(messages), 1)
         models.assert_called_once_with("lama")
+
+    def test_prepare_face_previews_loads_both_models_once_without_image_or_donor(self):
+        messages, _, plugins, _, enhancements = self.run_worker([
+            {"command": "prepare_face_previews"}, {"command": "prepare_face_previews"},
+            plugin_request("face_swap"),
+        ])
+        self.assertTrue(all(message["ok"] for message in messages))
+        self.assertEqual(plugins.call_count, 2)
+        self.assertEqual(messages[0]["plugins"], ["face_swap", "gfpgan"])
+        self.assertEqual(enhancements.call_count, 1)
 
     def test_face_swap_reuses_model_with_different_source_photos(self):
         first = plugin_request("face_swap")

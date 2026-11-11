@@ -1,11 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowDown, ArrowUp, FolderOpen, Play, Plus, RefreshCw, Trash2, X, History, Layers, Images, Download, Cpu, SlidersHorizontal } from "lucide-react";
+import { ArrowDown, ArrowUp, FolderOpen, Play, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { executeOperation, imageAction, type ActionResult, type ExportSettings, type Operation } from "./editorOperations";
 import type { HistoryEntry } from "./useEditHistory";
 import { usePreference } from "./preferences";
-import ToolSection from "./ToolSection";
 import { storage } from "./storage";
 import Select from "./Select";
 
@@ -32,7 +31,6 @@ function readSaved<T>(key: string, fallback: T): T {
   catch { return fallback; }
 }
 const defaultExport: ExportSettings = { directory: "", format: "png", quality: 95, width: 0, height: 0, suffix: "_edited", matte: "#ffffff" };
-const tabIcons = { history: History, workflows: Layers, batch: Images, export: Download, memory: Cpu };
 const operationKey = (operation: Operation) => operation.kind === "plugin"
   ? (["hat", "lanczos", "realesrgan", "photo"].includes(operation.plugin) ? "upscale" : operation.plugin)
   : operation.kind === "transform" ? operation.direction : operation.kind;
@@ -147,7 +145,7 @@ export default function Workspace(props: Props) {
   const workflowPicker = <label>Saved workflow<Select value={workflow?.id ?? ""} disabled={busy} onChange={(event) => setSelected(event.target.value)}>
     <option value="">Choose a workflow…</option>{workflows.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
   </Select></label>;
-  const exportControls = <ToolSection id="export-settings" title="Export settings" icon={SlidersHorizontal}><div className="workspace-form">
+  const exportControls = <section className="workspace-section" aria-label="Export settings"><h4>Export settings</h4><div className="workspace-form">
     <button disabled={busy} onClick={() => void chooseDirectory()}><FolderOpen size={14} /> Choose export folder</button>
     <small className="path-text" title={settings.directory}>{settings.directory || "No folder selected"}</small>
     <div className="form-row"><label>Format<Select value={settings.format} disabled={busy} onChange={(e) => setSettings({ ...settings, format: e.target.value as ExportSettings["format"] })}><option value="png">PNG · Lossless</option><option value="jpeg">JPEG</option><option value="webp">WebP</option></Select></label>
@@ -158,7 +156,7 @@ export default function Workspace(props: Props) {
       <label>Height (0 = auto)<input type="number" min="0" max="32768" value={settings.height} disabled={busy} onChange={(e) => updateDimension("height", +e.target.value)} /></label></div>
     {settings.format === "jpeg" && <label>Transparency fill<input type="color" value={settings.matte} disabled={busy} onChange={(e) => setSettings({ ...settings, matte: e.target.value })} /></label>}
     <small>Zero in both dimensions keeps the edited size. Existing files are never overwritten; duplicate names receive a number.</small>
-  </div></ToolSection>;
+  </div></section>;
 
   // A shortcut asked for one of the big actions; it runs once, with what the panel shows, or says why not.
   useEffect(() => {
@@ -187,7 +185,7 @@ export default function Workspace(props: Props) {
   return <aside className="workspace-drawer" aria-label="Editing workspace" onPointerDown={(e) => e.stopPropagation()} onPointerMove={(e) => e.stopPropagation()} onWheel={(e) => e.stopPropagation()}>
     {/* The tabs live in the dock's rail beside this panel, so the heading only names the open one. */}
     <div className="workspace-heading"><strong>{tab[0].toUpperCase() + tab.slice(1)}</strong><button aria-label="Close the panel" disabled={busy} onClick={props.onClose}><X size={17} /></button></div>
-    <div className="workspace-content"><ToolSection key={tab} id={`workspace-${tab}`} title={tab[0].toUpperCase() + tab.slice(1)} icon={tabIcons[tab]}>
+    <div className="workspace-content" key={tab}>
       {tab === "history" && <><p>Choose any step to return to it. A new edit replaces the steps after the selected one.</p><div className="history-list">{props.history.map((entry, index) => <button key={index} className={index === props.position ? "selected" : ""} disabled={busy} onClick={() => props.onJump(index)}><img src={entry.data} alt="" loading="lazy" decoding="async" /><span><strong>{index}. {entry.label}</strong>{index === props.position && <small>Current image</small>}</span></button>)}</div></>}
       {tab === "workflows" && <div className="workspace-form">
         {workflowPicker}
@@ -213,6 +211,6 @@ export default function Workspace(props: Props) {
           {!memory.models.length && !memory.plugins.length && <p>No models loaded.</p>}
           <button disabled={busy || (!memory.models.length && !memory.plugins.length)} onClick={() => void unload("plugin", "all")}>Unload all models</button></>}
       </div>}
-    </ToolSection></div>
+    </div>
   </aside>;
 }

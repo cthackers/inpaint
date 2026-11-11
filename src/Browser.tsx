@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import { ArrowDownUp, Columns3, Copy, Folder, Heart, FolderMinus, FolderPlus, Images, Info, Image as ImageIcon, ImagePlus, LayoutGrid, Pencil, Search, Star, Tag as TagIcon, Trash2, X } from "lucide-react";
+import { ArrowDownUp, Columns3, Copy, Folder, Heart, FolderMinus, FolderPlus, Images, Info, Image as ImageIcon, ImagePlus, LayoutGrid, Pencil, Search, Shuffle, Star, Tag as TagIcon, Trash2, X } from "lucide-react";
 import FolderNode from "./FolderTree";
 import { SettingsButton } from "./Settings";
 import { NewStoreDialog, SourcePicker, StorePanel } from "./Stores";
@@ -11,6 +11,7 @@ import { DuplicateGroups, DuplicatesPanel, type DuplicateView } from "./Duplicat
 import { DEFAULT_GALLERY_ORDER, type GalleryOrder, type ImageEntry, type PictureFacts, type Store, type StoreStats } from "./types";
 import { storage } from "./storage";
 import { usePreference } from "./preferences";
+import { nextShuffleSeed } from "./randomOrder";
 
 /** The image store shown instead of a folder, with its sidebar actions. */
 export type StoreView = {
@@ -287,7 +288,7 @@ function PictureMenu({ x, y, paths, albums, onEdit, onNewAlbum, onTag, onClose }
   return <div className="picture-menu" role="menu" ref={root} style={{ left: place.x, top: place.y }}>
     <div className="picture-menu-title">{many ? `${paths.length} pictures` : paths[0].split("/").at(-1)}</div>
     <button role="menuitem" onClick={() => act(onEdit)} disabled={many}><Pencil size={14} /> Edit</button>
-    {selected && !selected.isVirtual && <button role="menuitem" onClick={() => act(() => albums.onRemovePictures(selected, paths))}>
+    {selected && !selected.isVirtual && !selected.smartRules && <button role="menuitem" onClick={() => act(() => albums.onRemovePictures(selected, paths))}>
       <FolderMinus size={14} /><span>Remove from “{selected.name}”</span>
     </button>}
     <hr />
@@ -316,7 +317,7 @@ function PictureMenu({ x, y, paths, albums, onEdit, onNewAlbum, onTag, onClose }
     </div>
     <button role="menuitem" onClick={() => act(onNewAlbum)}><FolderPlus size={14} /> New album with {many ? "these pictures" : "this picture"}…</button>
     <button role="menuitem" onClick={() => act(onTag)}><TagIcon size={14} /> Add a tag…</button>
-    {selected && !selected.isVirtual && <>
+    {selected && !selected.isVirtual && !selected.smartRules && <>
       <hr />
       <button role="menuitem" onClick={() => act(() => albums.onSetCover(selected, paths[0]))} disabled={many}>
         <Star size={14} /><span>Use as cover of “{selected.name}”</span>
@@ -325,11 +326,12 @@ function PictureMenu({ x, y, paths, albums, onEdit, onNewAlbum, onTag, onClose }
   </div>;
 }
 
-const ORDERS: { id: GalleryOrder["by"]; label: string; first: [string, string] }[] = [
+const ORDERS: { id: GalleryOrder["by"]; label: string; first?: [string, string] }[] = [
   { id: "modified", label: "Date modified", first: ["Newest first", "Oldest first"] },
   { id: "added", label: "Date added", first: ["Newest first", "Oldest first"] },
   { id: "rating", label: "Star rating", first: ["Most stars first", "Fewest stars first"] },
   { id: "name", label: "Name", first: ["Z to A", "A to Z"] },
+  { id: "random", label: "Random" },
 ];
 
 /** The button beside the layout one: how the gallery is ordered, and which pictures it leaves out. */
@@ -358,11 +360,13 @@ function OrderPicker({ order, onOrder, choices }: { order: GalleryOrder; onOrder
     {open && <div className="layout-menu order-menu" role="dialog" aria-label="Order and filter">
       <div className="order-options" role="radiogroup" aria-label="Order by">
         {ORDERS.map((entry) => <button key={entry.id} role="radio" aria-checked={order.by === entry.id} className={order.by === entry.id ? "active" : ""}
-          onClick={() => change({ by: entry.id })}>{entry.label}</button>)}
+          onClick={() => change({ by: entry.id, ...(entry.id === "random" && order.by !== "random" ? { randomSeed: nextShuffleSeed(order.randomSeed) } : {}) })}>{entry.label}</button>)}
       </div>
       <div className="layout-modes">
-        <button className={order.descending ? "active" : ""} aria-pressed={order.descending} onClick={() => change({ descending: true })}>{current.first[0]}</button>
-        <button className={!order.descending ? "active" : ""} aria-pressed={!order.descending} onClick={() => change({ descending: false })}>{current.first[1]}</button>
+        {current.first ? <>
+          <button className={order.descending ? "active" : ""} aria-pressed={order.descending} onClick={() => change({ descending: true })}>{current.first[0]}</button>
+          <button className={!order.descending ? "active" : ""} aria-pressed={!order.descending} onClick={() => change({ descending: false })}>{current.first[1]}</button>
+        </> : <button title="Shuffle the pictures into a new random order" onClick={() => change({ randomSeed: nextShuffleSeed(order.randomSeed) })}><Shuffle size={14} /> Shuffle again</button>}
       </div>
       <div className="order-filters">
         <label className={choices.tagged ? "" : "unavailable"} title={choices.tagged ? "Untick to show only pictures without tags" : "Only while every picture of a store is shown"}>
@@ -633,7 +637,7 @@ export default function BrowserView({
   const title = tag ? tag.split("/").at(-1) ?? tag : album ? album.name : store.active ? store.active.name : currentPath ? baseName(currentPath) : "Your images";
   const subtitle = tag
     ? `Tagged ${tag} in ${store.active?.name ?? "the store"}`
-    : album ? `Album of ${store.active?.name ?? "the store"}` : store.active ? store.active.path : currentPath ?? "Open a folder containing PNG, JPG, WebP, GIF, BMP, or TIFF images.";
+    : album ? `${album.smartRules ? "Smart album" : "Album"} of ${store.active?.name ?? "the store"}` : store.active ? store.active.path : currentPath ?? "Open a folder containing PNG, JPG, WebP, GIF, BMP, or TIFF images.";
   const scanningStore = !!store.active && !!store.progress;
   useEffect(() => {
     // Back from the groups, the gallery returns to where it was scrolled.
@@ -721,7 +725,7 @@ export default function BrowserView({
             {store.duplicates.groups.length.toLocaleString()} {store.duplicates.groups.length === 1 ? "group" : "groups"}
           </div> : chosen.size > 0 ? <div className="chosen-bar">
             <span>{chosen.size.toLocaleString()} picked</span>
-            {store.albums.selected && !store.albums.selected.isVirtual && <button title={`Remove the picked pictures from “${store.albums.selected.fullName || store.albums.selected.name}”`}
+            {store.albums.selected && !store.albums.selected.isVirtual && !store.albums.selected.smartRules && <button title={`Remove the picked pictures from “${store.albums.selected.fullName || store.albums.selected.name}”`}
               onClick={() => { store.albums.onRemovePictures(store.albums.selected!, [...chosen]); setChosen(new Set()); }}>
               <FolderMinus size={14} /> Remove from “{store.albums.selected.name}”
             </button>}
@@ -785,8 +789,8 @@ export default function BrowserView({
         ) : album ? (
           <div className="empty-gallery">
             <div className="empty-icon"><ImageIcon size={28} /></div>
-            <h2>{album.total ? "None of these pictures are in this store" : "This album is empty"}</h2>
-            <p>{album.total
+            <h2>{album.smartRules ? "No pictures match these rules" : album.total ? "None of these pictures are in this store" : "This album is empty"}</h2>
+            <p>{album.smartRules ? "Edit the smart album’s rules from its menu in the sidebar. For Immich tags, use Read tags in the Tags panel to refresh matches." : album.total
               ? `${album.total.toLocaleString()} ${album.total === 1 ? "picture is" : "pictures are"} in the album, but none of them were found in ${store.active?.name ?? "this store"}${store.albums.immich ? ". Check the folder as Immich sees it, in Info." : "."}`
               : "Drop pictures on the album in the sidebar, or add them from a picture's right-click menu."}</p>
             <button className="primary-button" onClick={() => store.albums.onSelect(null)}>Show every picture</button>

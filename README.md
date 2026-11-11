@@ -225,8 +225,9 @@ saved into the open store, and into the open album.
 
 The button beside the layout button orders the gallery by **date modified**,
 **date added** (when the file was created in the folder, or uploaded, for
-Immich), **star rating** or **name**, either way. Its checkboxes leave pictures
-out:
+Immich), **star rating** or **name**, either way, or in **Random** order. Random
+order stays the same while editing, filtering and reopening the app; **Shuffle
+again** generates a new order. Its checkboxes leave pictures out:
 
 - **Show tagged pictures**: untick to see only pictures without tags.
 - **Show pictures in albums**: untick to see only pictures in no album. It
@@ -241,6 +242,17 @@ The store sidebar has **Albums**, **Tags** and **Info** tabs.
 
 - Albums can hold other albums. Their covers show the newest picture below them
   unless one was chosen, and counts include the albums inside.
+- Use an album's **⋮ → Export to folder…** menu to copy all its pictures, including
+  nested albums, to a folder on disk. Smart albums export their matching pictures;
+  gallery filters do not limit the export. Files keep their saved format and embedded
+  metadata, and filename clashes get numbered copies. Immich originals must be
+  available on this computer; any files that could not be copied are listed at the end.
+- **Smart albums** update automatically from rules: all or any required tags, excluded
+  tags, nested tags, favourites, rating range, filename, file types and date added.
+  Use **Smart album** in the Albums panel and **Edit rules** in its menu. These
+  albums match indexed pictures in the current store without moving files. Rules
+  stay in Inpaint, including for Immich stores; **Read tags** refreshes the cached
+  Immich tags used for matching.
 - Add pictures to an album by dragging them onto it, from a picture's right-click
   menu, or by picking several cards first (click, Ctrl-click, Shift-click) and
   using **Add to album…**, **Tag…** or **New album…** in the bar that appears.
@@ -303,9 +315,9 @@ controls in the application.
 | Ctrl + mouse wheel | Change brush size |
 | Space + drag or middle mouse drag | Pan |
 | Shift + paint | Apply the mask when the stroke ends |
-| Space | Apply the current mask |
+| Space | Apply the current mask, or the selected face preview while comparing |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
-| Left / Right or A / D | Previous / next picture |
+| Left / Right or A / D | Previous / next picture, or face preview while comparing |
 | Home / End | First / last picture |
 | S | Show or hide the picture strip |
 | Numpad `*` / Numpad `/` | Fit to window / actual size |
@@ -318,6 +330,11 @@ controls in the application.
 | Alt+U | Upscale using the selected method, scale, and denoising |
 | Alt+Z | Downscale to the selected size and filter |
 | Alt+F | Restore faces with GFPGAN and the shared strength |
+| Alt+P | Preview all saved faces |
+| Alt+M / Alt+Shift+M | Find and mark / find and remove watermarks |
+| Alt+Shift+E | Generate the extended canvas |
+| Alt+Shift+S | Refine selection edges |
+| Alt+0 | Collapse / expand the tools panel |
 | Alt+R | Replace the selected/largest face with the selected source |
 | Alt+B | Remove the background using the selected model |
 | Alt+G | Apply the replacement background settings |
@@ -330,7 +347,10 @@ controls in the application.
 Every shortcut except the arrows, Esc, Space and Ctrl+Shift+Z can be changed in
 **Settings** › **Shortcuts**. Action shortcuts also appear on tool buttons and in
 the help overlay; they use the current tool settings, including when a section is
-collapsed, and are disabled while typing or running an operation.
+collapsed, and are disabled while typing or running an operation. Face preview
+navigation stays available while other candidates generate, including when a
+comparison button has keyboard focus. Stop generation lives in a separate row
+and stays in place when generation finishes.
 
 [![In-app keyboard shortcut overlay](docs/screenshots/shortcuts.webp)](docs/screenshots/shortcuts.webp)
 
@@ -544,8 +564,24 @@ Armstrong and Eileen Collins.
   operation, the slider blends the raw and restored result without another model
   run.
 - **Saved faces**: every photo you choose is kept. Hover the tab beside the photo
-  picker to open them; click one to use it, **▷** to replace the face with it once,
-  or the bin to remove it. **Add photos** saves several at once.
+  picker to open them. Click a photo or its eye button to preview it, **▷** to
+  commit a replacement directly, or the bin to remove it. **Add photos** saves
+  several at once. Each store remembers its own saved faces and selected source;
+  switching stores restores those choices. Folder browsing has a separate list.
+  On upgrading from the shared list, existing choices are kept with the store
+  that was last open (or the folder workspace if no store was selected).
+- **Compare saved faces**: switching photos previews each on the same starting
+  picture, without stacking replacements. **Preview all faces** generates a
+  candidate for every saved face. Browse with the arrows, compare with **Original**,
+  then **Use this** (**Space**) to add one undoable edit or **Discard all** (**Esc**)
+  to keep your starting picture and close the comparison. A completed preview can
+  be applied while others are still generating. Save separately when ready.
+  In Saved faces, choose **Preview generation → 2 at a time** to generate two
+  candidates concurrently in separate model processes. This uses more GPU memory;
+  **1 at a time** is the default. First-use model preparation finishes before
+  parallel work starts, and the extra process releases its memory after the batch.
+  Stop generation finishes only the faces already running; failed faces do not
+  prevent comparing the others.
 
 Face replacement uses [InsightFace's INSwapper](https://github.com/deepinsight/insightface/tree/master/examples/in_swapper);
 its weights go in `models/faceswap/` and have their own license terms. To
@@ -626,7 +662,13 @@ menu, to change the store or save the clipboard.
   and red when saving failed, with the reason shown for a few seconds. Pictures
   saved into the open store, or its open album, appear in the gallery at once.
 
-Holding the keys needs an X11 session; on Wayland, keep the drop box always visible.
+Inpaint prefers X11 (XWayland on a Wayland desktop) so the drop box can use its
+configured position, stay above other windows and stay out of the taskbar, and
+the main window uses the desktop's normal title bar. If X11 is unavailable, it
+falls back to the available display backend. `GDK_BACKEND` overrides this choice;
+forcing `GDK_BACKEND=wayland` disables those drop box window controls.
+Holding the keys needs an X11 session; on Wayland, keep the drop box always visible,
+since XWayland cannot reliably watch keys pressed in native Wayland applications.
 
 ## Local API server
 

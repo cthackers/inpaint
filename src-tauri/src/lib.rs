@@ -15,6 +15,8 @@ mod animation;
 mod db;
 mod dropbox;
 mod duplicates;
+mod export;
+mod file_actions;
 mod hidden;
 mod http;
 mod immich;
@@ -619,27 +621,34 @@ struct ModelWorker {
 
 impl ModelWorker {
     fn start() -> Result<Self, String> {
+        // Workers share immutable runtime sources. Do not truncate a file another worker may import.
+        static START_LOCK: Mutex<()> = Mutex::new(());
+        let _starting = START_LOCK.lock().map_err(|_| "Worker startup lock failed")?;
+        let write_script = |path: PathBuf, source: &str| -> std::io::Result<()> {
+            if fs::read(&path).ok().as_deref() == Some(source.as_bytes()) { return Ok(()); }
+            fs::write(path, source)
+        };
         let project_dir = project_dir();
         let models_dir = project_dir.join("models");
         let runtime_dir = models_dir.join(".runtime");
         let script_path = runtime_dir.join("inpaint_worker.py");
         fs::create_dir_all(&runtime_dir)
             .map_err(|error| format!("Cannot create model runtime directory: {error}"))?;
-        fs::write(&script_path, INPAINT_SCRIPT)
+        write_script(script_path.clone(), INPAINT_SCRIPT)
             .map_err(|error| format!("Cannot prepare persistent model worker: {error}"))?;
-        fs::write(runtime_dir.join("face_swap.py"), FACE_SWAP_SCRIPT)
+        write_script(runtime_dir.join("face_swap.py"), FACE_SWAP_SCRIPT)
             .map_err(|error| format!("Cannot prepare face-swap worker: {error}"))?;
-        fs::write(runtime_dir.join("upscale.py"), UPSCALE_SCRIPT)
+        write_script(runtime_dir.join("upscale.py"), UPSCALE_SCRIPT)
             .map_err(|error| format!("Cannot prepare upscaling worker: {error}"))?;
-        fs::write(runtime_dir.join("restore.py"), RESTORE_SCRIPT).map_err(|e| e.to_string())?;
-        fs::write(runtime_dir.join("restormer.py"), RESTORMER_SCRIPT).map_err(|e| e.to_string())?;
-        fs::write(runtime_dir.join("restormer_arch.py"), RESTORMER_ARCH_SCRIPT).map_err(|e| e.to_string())?;
-        fs::write(runtime_dir.join("editing.py"), EDITING_SCRIPT)
+        write_script(runtime_dir.join("restore.py"), RESTORE_SCRIPT).map_err(|e| e.to_string())?;
+        write_script(runtime_dir.join("restormer.py"), RESTORMER_SCRIPT).map_err(|e| e.to_string())?;
+        write_script(runtime_dir.join("restormer_arch.py"), RESTORMER_ARCH_SCRIPT).map_err(|e| e.to_string())?;
+        write_script(runtime_dir.join("editing.py"), EDITING_SCRIPT)
             .map_err(|error| format!("Cannot prepare editing worker: {error}"))?;
-        fs::write(runtime_dir.join("advanced.py"), ADVANCED_SCRIPT).map_err(|e| e.to_string())?;
-        fs::write(runtime_dir.join("downloads.py"), DOWNLOADS_SCRIPT).map_err(|e| e.to_string())?;
-        fs::write(runtime_dir.join("worker_protocol.py"), PROTOCOL_SCRIPT).map_err(|e| e.to_string())?;
-        fs::write(runtime_dir.join("watermark.py"), WATERMARK_SCRIPT).map_err(|e| e.to_string())?;
+        write_script(runtime_dir.join("advanced.py"), ADVANCED_SCRIPT).map_err(|e| e.to_string())?;
+        write_script(runtime_dir.join("downloads.py"), DOWNLOADS_SCRIPT).map_err(|e| e.to_string())?;
+        write_script(runtime_dir.join("worker_protocol.py"), PROTOCOL_SCRIPT).map_err(|e| e.to_string())?;
+        write_script(runtime_dir.join("watermark.py"), WATERMARK_SCRIPT).map_err(|e| e.to_string())?;
 
         let mut command = Command::new(python_executable());
         runtime::clear_python_environment(&mut command);
@@ -815,14 +824,17 @@ impl Drop for ModelWorker {
 #[derive(Clone, Default)]
 struct InpaintWorkerState {
     worker: Arc<Mutex<Option<ModelWorker>>>,
+    preview_worker: Arc<Mutex<Option<ModelWorker>>>,
 }
 
 impl InpaintWorkerState {
     fn shutdown(&self) {
-        if let Ok(mut worker) = self.worker.lock() {
+        for slot in [&self.worker, &self.preview_worker] {
+          if let Ok(mut worker) = slot.lock() {
             if let Some(mut active) = worker.take() {
                 active.shutdown();
             }
+          }
         }
     }
 }
@@ -959,10 +971,18 @@ async fn image_action(
     reference_data: Option<String>,
     options: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let worker_state = state.worker.clone();
+    let worker_state = if command == "face_preview" && options["previewWorker"].as_u64() == Some(1) {
+        state.preview_worker.clone()
+    } else { state.worker.clone() };
+    let preview_worker = state.preview_worker.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if !matches!(command.as_str(), "memory" | "unload" | "detect_faces" | "face_preview" | "edit" | "export" | "select" | "mask_edit" | "retouch" | "refine_edges" | "outpaint" | "watermark") {
+        if !matches!(command.as_str(), "memory" | "unload" | "prepare_face_previews" | "release_face_previews" | "detect_faces" | "face_preview" | "edit" | "export" | "select" | "mask_edit" | "retouch" | "refine_edges" | "outpaint" | "watermark") {
             return Err("Unsupported image action".into());
+        }
+        if matches!(command.as_str(), "release_face_previews" | "unload") {
+            // Taking/dropping the worker waits for its current request, then releases the process and GPU memory.
+            preview_worker.lock().map_err(|_| "Preview worker lock failed".to_string())?.take();
+            if command == "release_face_previews" { return Ok(serde_json::json!({"ok": true})); }
         }
         let work_dir = Builder::new().prefix("inpaint-edit-").tempdir().map_err(|e| e.to_string())?;
         let input = work_dir.path().join("input.png");
@@ -971,7 +991,7 @@ async fn image_action(
         let reference = work_dir.path().join("reference.png");
         if let Some(data) = image_data {
             fs::write(&input, decode_data_url(&data)?).map_err(|e| e.to_string())?;
-        } else if !matches!(command.as_str(), "memory" | "unload") {
+        } else if !matches!(command.as_str(), "memory" | "unload" | "prepare_face_previews") {
             return Err("No image was provided".into());
         }
         if let Some(data) = reference_data {
@@ -981,6 +1001,7 @@ async fn image_action(
             "raw_output": raw_output, "reference": if reference.is_file() { Some(&reference) } else { None }, "options": options});
         let mut worker = worker_state.lock().map_err(|_| "Worker lock failed".to_string())?;
         let mut response = ensure_worker(&mut worker)?.action(&request)?;
+        drop(worker);
         for (path, key) in [(&output, "imageData"), (&raw_output, "rawData")] {
             if path.is_file() {
                 let bytes = fs::read(path).map_err(|e| e.to_string())?;
@@ -1039,7 +1060,14 @@ pub fn run() {
     }
 
     #[cfg(target_os = "linux")]
-    configure_webkit_renderer();
+    {
+        // The drop box needs X11 positioning, stacking and taskbar hints. Prefer XWayland
+        // on Wayland desktops too; Tao's native Wayland path also adds a GTK header bar.
+        // Set this before Tauri initializes GTK. GDK_BACKEND still overrides the order,
+        // and the wildcard allows startup on desktops without an X server.
+        gtk::gdk::set_allowed_backends("x11,*");
+        configure_webkit_renderer();
+    }
 
     let worker_state = InpaintWorkerState::default();
     let shutdown_state = worker_state.clone();
@@ -1092,11 +1120,14 @@ pub fn run() {
             read_image_data,
             read_thumbnail_data,
             save_image,
+            export::export_pictures,
             animation::read_animation,
             animation::animation_info,
             animation::save_animation,
             image_entries,
             open_folder,
+            file_actions::reveal_image,
+            file_actions::copy_image_to_clipboard,
             delete_image,
             loaded_models,
             loaded_plugins,

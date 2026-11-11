@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { Archive, ExternalLink, Heart, Images, LoaderCircle, Plus, Star, Tag as TagIcon, UserRound, X } from "lucide-react";
+import PictureFileActions from "./PictureFileActions";
 
 type Tag = { id: string; name: string; value: string };
 type Album = { id: string; albumName: string; assetCount: number; shared: boolean };
@@ -28,9 +29,10 @@ const withExif = (details: Details, exif: Partial<Exif>) => withAsset(details, {
 const byLabel = (a: Option, b: Option) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" });
 
 /** Chips for what the picture has, and a search box that adds existing entries or creates new ones. */
-export function ChipPicker({ chosen, options, placeholder, createLabel, disabled, onAdd, onRemove, onCreate }: {
+export function ChipPicker({ chosen, options, placeholder, createLabel, disabled, onAdd, onRemove, onCreate, popupClassName = "" }: {
   chosen: Option[]; options: Option[]; placeholder: string; createLabel: string; disabled: boolean;
   onAdd: (id: string) => void; onRemove: (id: string) => void; onCreate: (label: string) => void;
+  popupClassName?: string;
 }) {
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
@@ -69,7 +71,7 @@ export function ChipPicker({ chosen, options, placeholder, createLabel, disabled
       setPlace({ left: box.left, top: box.bottom + 4, width: box.width, maxHeight: Math.max(120, window.innerHeight - box.bottom - 16) });
     };
     measure();
-    const scroller = input.current?.closest(".immich-content");
+    const scroller = input.current?.closest(".immich-content, .server-dialog");
     window.addEventListener("resize", measure);
     scroller?.addEventListener("scroll", measure);
     return () => {
@@ -97,7 +99,7 @@ export function ChipPicker({ chosen, options, placeholder, createLabel, disabled
           else if (event.key === "Escape") { if (query) setQuery(""); else event.currentTarget.blur(); }
           else if (event.key === "Backspace" && !query && chosen.length) onRemove(chosen[chosen.length - 1].id);
         }} />
-      {open && entries.length > 0 && place && createPortal(<ul className="immich-options" role="listbox"
+      {open && entries.length > 0 && place && createPortal(<ul className={`immich-options ${popupClassName}`} role="listbox"
         style={{ left: place.left, top: place.top, width: place.width, maxHeight: place.maxHeight }}>
         {entries.map((entry, index) => <li key={entry.kind === "add" ? entry.option.id : "create"} role="option" aria-selected={index === highlight}
           className={`${index === highlight ? "active" : ""} ${entry.kind === "create" ? "create" : ""}`}
@@ -331,9 +333,12 @@ export default function ImmichPanel({ path, storeId, onClose }: { path: string; 
         </div>
       </Section>}
 
-      {facts.length > 0 && <Section title="Details">
-        <dl className="immich-details">{facts.map(([label, value]) => <div key={label} style={{ display: "contents" }}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
-      </Section>}
+      <Section title="Details">
+        <dl className="immich-details">
+          <dt>File</dt><dd><PictureFileActions key={path} path={path} /></dd>
+          {facts.map(([label, value]) => <div key={label} style={{ display: "contents" }}><dt>{label}</dt><dd>{value}</dd></div>)}
+        </dl>
+      </Section>
     </div>
   </aside>;
 }

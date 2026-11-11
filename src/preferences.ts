@@ -1,11 +1,6 @@
 import { useEffect, useState } from "react";
 import { storage } from "./storage";
 
-/** Path of the face swap source photo; also read by the local API server's face-swap. */
-export const FACE_SOURCE_PREFERENCE = "inpaint.faceSourcePath";
-/** Paths of the saved face photos, newest first. */
-export const FACE_LIBRARY_PREFERENCE = "inpaint.faceLibrary";
-
 // Recover individual fields when preferences from an older version are incomplete.
 function restore<T>(saved: unknown, fallback: T): T {
   // Lists are kept whole; usePreference's `valid` checks their items.

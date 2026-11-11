@@ -3,7 +3,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { confirm, open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft, ArrowRight, Brush, Check, Eraser, LoaderCircle,
-  ChevronDown, Eye, EyeOff, FlipHorizontal, FlipVertical, ImageOff, Maximize2, Minimize2, Pause, Play, Redo2, RotateCcw, RotateCw,
+  ChevronDown, ChevronsLeft, ChevronsRight, Eye, EyeOff, FlipHorizontal, FlipVertical, ImageOff, Maximize2, Minimize2, Pause, Play, Redo2, RotateCcw, RotateCw,
   Save, Scan, ScanFace, Sparkles, Stamp, Tags, Trash2, Undo2, UserRound, X, ZoomIn, ZoomOut, Crop, History, Layers, Download, SlidersHorizontal, Images, Cpu, Gauge, ImagePlus, LayoutGrid, StickyNote,
 } from "lucide-react";
 import type { ImageEntry, Store } from "./types";
@@ -16,7 +16,9 @@ import { adjustImage, neutralAdjustments, loadImage, blendImages, executeOperati
 import advancedSections, { BackgroundEdgeTools, type BrushTool, type BrushSettings, type Edges, type Extension } from "./AdvancedTools";
 import { INPAINT_MODELS, type InpaintModel } from "./models";
 import FaceLibrary from "./FaceLibrary";
-import { FACE_LIBRARY_PREFERENCE, usePreference, useSavedChoice } from "./preferences";
+import FacePreviewBar from "./FacePreviewBar";
+import { previewData, useFacePreviews } from "./useFacePreviews";
+import { usePreference, useSavedChoice } from "./preferences";
 import ToolSection, { SECTION_DRAG, type SectionEntry } from "./ToolSection";
 import { comboOf, keyLabel, shortcutFor, SHORTCUTS, useShortcutKeys, type ShortcutId } from "./shortcuts";
 import { useCanvasView } from "./useCanvasView";
@@ -31,6 +33,8 @@ type EditorProps = {
   brushSize: number;
   onBrushSizeChange: Dispatch<SetStateAction<number>>;
   faceSwapSource: FaceSwapSource | null;
+  faceLibrary: string[];
+  onFaceLibraryChange: Dispatch<SetStateAction<string[]>>;
   onFaceSwapSourceChange: (source: FaceSwapSource) => void;
   onFaceSwapSourceClear: () => void;
   onExit: () => void;
@@ -153,7 +157,7 @@ const DOCK_TABS: { id: DockTab; label: string; icon: typeof History }[] = [
   { id: "memory", label: "Memory", icon: Cpu },
 ];
 
-export default function Editor({ image, index, total, brushSize, onBrushSizeChange, faceSwapSource, onFaceSwapSourceChange, onFaceSwapSourceClear, onExit, onNavigate, initialData, replaceRequested, onReplace, onReplaceCancel, onSaved, onDeleted, immichStores, stripOpen = false, onStripToggle, onViewport, onBusy, navigator, duplicate }: EditorProps) {
+export default function Editor({ image, index, total, brushSize, onBrushSizeChange, faceLibrary, onFaceLibraryChange: setFaceLibrary, faceSwapSource, onFaceSwapSourceChange, onFaceSwapSourceClear, onExit, onNavigate, initialData, replaceRequested, onReplace, onReplaceCancel, onSaved, onDeleted, immichStores, stripOpen = false, onStripToggle, onViewport, onBusy, navigator, duplicate }: EditorProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const maskRef = useRef<HTMLCanvasElement>(null);
   const drawing = useRef(false);
@@ -168,6 +172,10 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
 
   const history = useEditHistory();
   const imageData = history.data;
+  const facePreviews = useFacePreviews();
+  const [facePreviewConcurrency, setFacePreviewConcurrency] = useSavedChoice("inpaint.facePreviewConcurrency", [1, 2] as const);
+  const [acceptingFacePreview, setAcceptingFacePreview] = useState(false);
+  const acceptingFace = useRef(false);
   const dirty = history.dirty;
   const [originalImageData, setOriginalImageData] = useState("");
   // An animated GIF keeps its frames as they came from disk. The first one is edited on screen, and Save
@@ -191,7 +199,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   const [operationWorking, setWorking] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [adjustmentActive, setAdjustmentActive] = useState(false);
-  const working = operationWorking || previewBusy || adjustmentActive;
+  const working = operationWorking || previewBusy || adjustmentActive || facePreviews.active || facePreviews.busy;
   const [saving, setSaving] = useState(false);
   const [choosingFace, setChoosingFace] = useState(false);
   const [message, setMessage] = useState("");
@@ -242,11 +250,12 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
 
   // The dock on the right shows one panel at a time, chosen in its vertical tabs; "" keeps it closed.
   const [dockTab, setDockTab] = useSavedChoice<DockTab | "">("inpaint.dockTab", ["", "history", "workflows", "batch", "export", "memory", "info", "annotations"]);
+  const [toolsCollapsed, setToolsCollapsed] = usePreference("inpaint.toolsCollapsed", false);
   const [workspaceCommand, setWorkspaceCommand] = useState<WorkspaceCommand>({ name: "run-workflow", count: 0 });
   const toolbar = useRef<HTMLElement>(null);
   useLayoutEffect(() => {
-    if (toolbar.current) toolbar.current.scrollTop = toolbarScroll;
-  }, []);
+    if (!toolsCollapsed && toolbar.current) toolbar.current.scrollTop = toolbarScroll;
+  }, [toolsCollapsed]);
   const [compare, setCompare] = useState(false);
   const [divider, setDivider] = usePreference("inpaint.divider", 50, (value) => value >= 0 && value <= 100);
   const [compareWith, setCompareWith] = useSavedChoice<string>("inpaint.compareWith", ["previous", "original"]);
@@ -279,12 +288,6 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   const [extension, setExtension] = usePreference<Extension>("inpaint.extension", { left: 128, right: 128, top: 0, bottom: 0, model: "sdxl", prompt: "" });
   const [faceColorMatch, setFaceColorMatch] = useSavedChoice<number>("inpaint.faceColorMatch", [0, ...Array.from({ length: 20 }, (_, i) => (i + 1) * 5)]);
   const activeFaceSource = selectedFace ? assignments[selectedFace.id] ?? faceSwapSource : faceSwapSource;
-  const [faceLibrary, setFaceLibrary] = usePreference<string[]>(FACE_LIBRARY_PREFERENCE, [], (paths) => paths.every((path) => typeof path === "string"));
-  // Every face photo chosen joins the saved faces, newest first.
-  useEffect(() => {
-    const path = faceSwapSource?.path;
-    if (path) setFaceLibrary((saved) => (saved.includes(path) ? saved : [path, ...saved]));
-  }, [faceSwapSource?.path]);
   const [deleting, setDeleting] = useState(false);
   // Annotations: the picture's notes, whether they show, drawing a new one and the one being pointed at.
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -336,6 +339,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
   // with the next picture's props. Keep the editor's panels and scroll position mounted.
   useLayoutEffect(() => {
     let active = true;
+    facePreviews.discard();
     history.reset("");
     setOriginalImageData("");
     setAnimation(null);
@@ -802,6 +806,32 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       strength: restorationStrength / 100, colorMatch: faceColorMatch / 100, target: box ? [box[0] + box[2] / 2, box[1] + box[3] / 2] : undefined });
   };
 
+  const previewFaces = (donors: string[]) => {
+    if (operationWorking || previewBusy || adjustmentActive || saving || choosingFace || facePreviews.busy || acceptingFace.current || !imageData) return;
+    if (!donors.length) { setMessage("Add photos to Saved faces first."); return; }
+    const box = selectedFace?.box;
+    setShowOriginal(false); setCompare(false); setCropMode(false); setSelectingFace(false);
+    setRestorationPreview(null); setMessage("");
+    void facePreviews.start(imageData, { strength: restorationStrength / 100, colorMatch: faceColorMatch / 100,
+      target: box ? [box[0] + box[2] / 2, box[1] + box[3] / 2] : undefined }, donors, facePreviewConcurrency);
+  };
+
+  const acceptFacePreview = async () => {
+    const candidate = facePreviews.candidate;
+    if (!candidate || acceptingFace.current) return;
+    facePreviews.stop();
+    acceptingFace.current = true; setAcceptingFacePreview(true);
+    try {
+      const data = await previewData(candidate.src);
+      const previousFaces = faces, previousSelection = selectedFace, previousAssignments = assignments;
+      commitEdit(data, candidate.operation.label, candidate.operation);
+      setFaces(previousFaces); setSelectedFace(previousSelection); setAssignments(previousAssignments);
+      facePreviews.discard();
+      setMessage("Face preview applied. Save when you are ready.");
+    } catch (error) { setMessage(`Cannot apply preview: ${String(error)}`); }
+    finally { acceptingFace.current = false; setAcceptingFacePreview(false); }
+  };
+
   const runImagePlugin = async (plugin: "gfpgan" | "realesrgan" | "remove_bg" | "face_swap" | "hat" | "lanczos" | "photo", option: string, pluginScale: number, label: string) => {
     if (plugin === "face_swap") {
       if (!activeFaceSource || choosingFace) return;
@@ -991,6 +1021,11 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       if (backgroundType === "image" && !backgroundPath) { setMessage("Choose a background image first."); return; }
       void performOperation(backgroundOperation);
     },
+    "tool.previewFaces": () => previewFaces(faceLibrary),
+    "tool.findWatermarks": () => void findWatermarks(),
+    "tool.removeWatermarks": () => { if (watermarkOperation.prompts.length) void performOperation(watermarkOperation); else setMessage("Write what to look for in Watermarks first."); },
+    "tool.outpaint": () => { if ([extension.left, extension.right, extension.top, extension.bottom].some(Boolean)) void performOperation({ kind: "outpaint", label: "Extend canvas", ...extension }); else setMessage("Set at least one canvas extension size first."); },
+    "tool.refineSelection": () => void refineSelection(),
     "tool.detectFaces": () => void detectFaces(),
     "tool.refineEdges": () => void performOperation({ kind: "refine_edges", label: "Refine background edges", ...edges }),
     "tool.crop": toggleCrop,
@@ -1015,6 +1050,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     "panel.batch": () => openPanel("batch"),
     "panel.export": () => openPanel("export"),
     "panel.memory": () => openPanel("memory"),
+    "panel.tools": () => setToolsCollapsed((value) => !value),
     "panel.strip": () => { if (total > 1) onStripToggle?.(); },
     "workspace.runWorkflow": () => askWorkspace("workflows", "run-workflow"),
     "workspace.export": () => askWorkspace("export", "export"),
@@ -1022,7 +1058,12 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     "editor.save": () => void save(),
     "editor.undo": () => undo(),
     "editor.redo": () => redo(),
-    "editor.original": () => { setCompare(false); setSelectingFace(false); setCropMode(false); setShowOriginal((value) => !value); },
+    "editor.original": () => {
+      if (facePreviews.active) {
+        if (!acceptingFace.current) facePreviews.select(facePreviews.selected ? null : facePreviews.results[0]?.donor ?? null);
+        return;
+      }
+      setCompare(false); setSelectingFace(false); setCropMode(false); setShowOriginal((value) => !value); },
     "editor.previous": () => { if (!working) safeNavigate(-1); },
     "editor.next": () => { if (!working) safeNavigate(1); },
     "editor.first": () => { if (!working) safeNavigate(-index); },
@@ -1037,6 +1078,12 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
 
   useEffect(() => {
     const keyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && event.repeat) { event.preventDefault(); return; }
+      if (facePreviews.active && event.key === "Escape") {
+        event.preventDefault();
+        if (!acceptingFace.current) facePreviews.discard();
+        return;
+      }
       if (pendingLeave) {
         if (event.key === "Enter" || event.key.toLowerCase() === "y") {
           event.preventDefault();
@@ -1057,13 +1104,30 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
         || (target instanceof HTMLElement && target.isContentEditable);
       const combo = comboOf(event);
       const shortcut = textEntry ? undefined : shortcutFor(keys, combo);
+      const typing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || textEntry
+        || (target instanceof Element && !!target.closest('[role="combobox"], [role="listbox"]'));
+      // Preview navigation is allowed while the remaining faces generate, including from focused buttons.
+      if (facePreviews.active && !typing) {
+        if (combo === "Space") {
+          event.preventDefault();
+          spaceDown.current = false; spaceUsedForPan.current = false;
+          if (!event.repeat) void acceptFacePreview();
+          return;
+        }
+        const direction = combo === "ArrowLeft" || shortcut === "editor.previous" ? -1
+          : combo === "ArrowRight" || shortcut === "editor.next" ? 1 : 0;
+        if (direction) {
+          event.preventDefault();
+          if (!acceptingFace.current) facePreviews.move(direction);
+          return;
+        }
+      }
       // A tool runs with a key held down or not, but never over one already running or a stroke in progress.
       if (shortcut && toolActions[shortcut]) {
         event.preventDefault();
-        if (!event.repeat && !working && !saving && !choosingFace && imageData && !drawing.current && !panning.current && !cropStart.current && !cropDrag.current) toolActions[shortcut]!();
+        if (!event.repeat && (!working || shortcut === "tool.previewFaces") && !saving && !choosingFace && imageData && !drawing.current && !panning.current && !cropStart.current && !cropDrag.current) toolActions[shortcut]!();
         return;
       }
-      const typing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || textEntry;
       if (drawing.current || panning.current || cropStart.current || cropDrag.current) return;
       // While cropping, Enter applies the crop and Esc leaves it.
       if (cropMode && !textEntry && (event.key === "Enter" || event.key === "Escape")) {
@@ -1124,7 +1188,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
       window.removeEventListener("keyup", keyUp);
       window.removeEventListener("blur", blur);
     };
-  }, [actualSize, fitImage, imageData, index, maskDirty, model, pendingLeave, prompt, redo, resolvePendingLeave, safeExit, safeNavigate, save, total, undo, working, saving, cropMode, selectingFace, compare, showOriginal, zoomIn, zoomOut, toolActions, editorActions, keys, onReplaceCancel, annotating, notePending, cropRect, cropAngle]);
+  }, [actualSize, fitImage, imageData, index, maskDirty, model, pendingLeave, prompt, redo, resolvePendingLeave, safeExit, safeNavigate, save, total, undo, working, saving, cropMode, selectingFace, compare, showOriginal, zoomIn, zoomOut, toolActions, editorActions, keys, onReplaceCancel, annotating, notePending, cropRect, cropAngle, facePreviews.active, facePreviews.discard]);
 
   const canvasPoint = (event: { clientX: number; clientY: number }): Point | null => {
     const bounds = getViewportBounds();
@@ -1397,6 +1461,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
     setToolOrder(next);
   }, [setToolOrder]);
   const showSection = (id: string) => {
+    setToolsCollapsed(false);
     setOpened((current) => ({ id, count: current.id === id ? current.count + 1 : 1 }));
     // The section opens on the next render, so the scroll waits for it to take its height.
     requestAnimationFrame(() => requestAnimationFrame(() => document.getElementById(`tool-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" })));
@@ -1410,7 +1475,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
               {compare && <><Select aria-label="Compare against" value={compareWith} onChange={(e) => setCompareWith(e.target.value)}><option value="previous">Before the current step</option><option value="original">Original image</option></Select><input aria-label="Comparison position" type="range" min="0" max="100" value={divider} onChange={(e) => setDivider(+e.target.value)} /><div className="plugin-description">Before on the left, after on the right. Zoom and pan are linked. Before fits the current frame.</div></>}
             </ToolSection>
     ) },
-    ...advancedSections({ openSignal, onMove: moveSection, busy: operationWorking || previewBusy || saving, tool: brushTool, onTool: (tool) => { setBrushTool(tool); setCropMode(false); setCompare(false); setShowOriginal(false); setSelectingFace(false); }, brush: brushSettings, setBrush: setBrushSettings, size: brushSize, setSize: onBrushSizeChange, maskDirty: maskDirty, refineMask: () => void refineSelection(), resetPoints: () => setSmartPoints([]), pointCount: smartPoints.length, sourceSet: cloneSource !== null, adjustmentActive: adjustmentActive, adjustments: adjustments, onAdjust: setAdjustments, onStartAdjust: () => { setAdjustmentActive(true); setCompare(false); setCropMode(false); setShowOriginal(false); setSelectingFace(false); }, onApplyAdjust: () => void applyColorAdjustments(), onCancelAdjust: () => { setAdjustmentActive(false); setColorPreview(""); }, edges: edges, setEdges: setEdges, onEdges: () => void performOperation({ kind: "refine_edges", label: "Refine background edges", ...edges }), extension: extension, setExtension: setExtension, onExtend: () => void performOperation({ kind: "outpaint", label: "Extend canvas", ...extension }), width: dimensions.width, height: dimensions.height }),
+    ...advancedSections({ refineKey: keyOf("tool.refineSelection"), extendKey: keyOf("tool.outpaint"), openSignal, onMove: moveSection, busy: operationWorking || previewBusy || saving || facePreviews.active || facePreviews.busy, tool: brushTool, onTool: (tool) => { setBrushTool(tool); setCropMode(false); setCompare(false); setShowOriginal(false); setSelectingFace(false); }, brush: brushSettings, setBrush: setBrushSettings, size: brushSize, setSize: onBrushSizeChange, maskDirty: maskDirty, refineMask: () => void refineSelection(), resetPoints: () => setSmartPoints([]), pointCount: smartPoints.length, sourceSet: cloneSource !== null, adjustmentActive: adjustmentActive, adjustments: adjustments, onAdjust: setAdjustments, onStartAdjust: () => { setAdjustmentActive(true); setCompare(false); setCropMode(false); setShowOriginal(false); setSelectingFace(false); }, onApplyAdjust: () => void applyColorAdjustments(), onCancelAdjust: () => { setAdjustmentActive(false); setColorPreview(""); }, edges: edges, setEdges: setEdges, onEdges: () => void performOperation({ kind: "refine_edges", label: "Refine background edges", ...edges }), extension: extension, setExtension: setExtension, onExtend: () => void performOperation({ kind: "outpaint", label: "Extend canvas", ...extension }), width: dimensions.width, height: dimensions.height }),
     ...(cropMode ? [{ id: "crop", title: "Crop and straighten", icon: Crop, node: (
             <ToolSection id="crop" title="Crop and straighten" icon={Crop} openSignal={openSignal("crop")} onMove={moveSection}>
               <Select aria-label="Crop aspect ratio" value={cropRatio} onChange={(e) => {
@@ -1435,13 +1500,13 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
               <div className="denoise-control"><label htmlFor="watermark-size">Largest watermark <output>{watermarkMaxPercent}%</output></label>
                 <input id="watermark-size" type="range" min="1" max="60" value={watermarkMaxPercent} disabled={operationWorking || saving} onChange={(event) => setWatermarkMaxPercent(+event.target.value)} /></div>
               <div className="plugin-description">Florence-2 marks what it finds (1.5 GB download on first use). Look it over, then remove it with {model.name}. Larger areas are usually the subject, so they are skipped.</div>
-              <button className="plugin-run" disabled={working || saving || !imageData} onClick={() => void findWatermarks()}>Find and mark</button>
-              <button className="plugin-run" disabled={working || saving || !imageData || !watermarkOperation.prompts.length} onClick={() => void performOperation(watermarkOperation)}>Find and remove at once</button>
+              <button className="plugin-run" disabled={working || saving || !imageData} onClick={() => void findWatermarks()}>Find and mark{keyOf("tool.findWatermarks") && <kbd className="action-shortcut">{keyOf("tool.findWatermarks")}</kbd>}</button>
+              <button className="plugin-run" disabled={working || saving || !imageData || !watermarkOperation.prompts.length} onClick={() => void performOperation(watermarkOperation)}>Find and remove at once{keyOf("tool.removeWatermarks") && <kbd className="action-shortcut">{keyOf("tool.removeWatermarks")}</kbd>}</button>
             </ToolSection>
     ) },
     { id: "restoration-strength", title: "Restoration strength", icon: Gauge, node: (
             <ToolSection id="restoration-strength" title="Restoration strength" icon={Gauge} openSignal={openSignal("restoration-strength")} onMove={moveSection}>
-              <div className="denoise-control"><label htmlFor="restoration-strength">GFPGAN + face replacement <output>{restorationStrength}%</output></label><input id="restoration-strength" type="range" min="0" max="100" value={restorationStrength} disabled={operationWorking || saving} onChange={(e) => setRestorationStrength(+e.target.value)} /><div><span>Raw face</span><span>Restored face</span></div></div>
+              <div className="denoise-control"><label htmlFor="restoration-strength">GFPGAN + face replacement <output>{restorationStrength}%</output></label><input id="restoration-strength" type="range" min="0" max="100" value={restorationStrength} disabled={operationWorking || saving || facePreviews.active || facePreviews.busy} onChange={(e) => setRestorationStrength(+e.target.value)} /><div><span>Raw face</span><span>Restored face</span></div></div>
               <div className="plugin-description">Shared by both tools. {restorationPreview ? "Adjusts the last result instantly without rerunning the model." : "Applied to the next restoration or replacement."}</div>
             </ToolSection>
     ) },
@@ -1459,7 +1524,10 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
                 {activeFaceSource && <img src={activeFaceSource.data} alt="Selected face source" />}
                 <span>{choosingFace ? "Loading…" : activeFaceSource ? "Change photo" : "Select photo"}</span>
               </button>
-              {faceLibrary.length > 0 && <FaceLibrary paths={faceLibrary} activePath={activeFaceSource?.path} busy={working || saving || choosingFace}
+              {faceLibrary.length > 0 && <FaceLibrary paths={faceLibrary} activePath={facePreviews.selected ?? activeFaceSource?.path}
+                busy={operationWorking || previewBusy || adjustmentActive || saving || choosingFace || facePreviews.busy || acceptingFacePreview}
+                concurrency={facePreviewConcurrency} onConcurrencyChange={setFacePreviewConcurrency}
+                previewing={facePreviews.active} previewAllKey={keyOf("tool.previewFaces")} onPreview={(path) => previewFaces([path])} onPreviewAll={() => previewFaces(faceLibrary)}
                 onUse={chooseSavedFace} onApply={(path) => void replaceFace(path)} onRemove={removeSavedFace} onAdd={() => void addFacePhotos()} />}
               </div>
               {activeFaceSource && <button className="plugin-run" onClick={clearFacePhoto} disabled={working || saving || choosingFace}><X size={13} /> Clear photo</button>}
@@ -1704,11 +1772,11 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
             {saving ? <LoaderCircle className="spin" size={17} /> : <Save size={17} />} Save
           </button>
           <button className="apply-button" onClick={() => void applyInpaint()} disabled={!maskDirty || working || saving || cropMode || selectingFace || compare || showOriginal}>
-            {working ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}
+            {working && (!facePreviews.active || facePreviews.busy) ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}
             {/* Both labels stay in the button, so it keeps one width while it works. */}
             <span className="apply-label">
               <span className={working ? "apply-hidden" : ""}><span>Remove object</span><kbd>Space</kbd></span>
-              <span className={working ? "" : "apply-hidden"}>Working…</span>
+              <span className={working ? "" : "apply-hidden"}>{facePreviews.active && !facePreviews.busy ? "Review previews" : "Working…"}</span>
             </span>
           </button>
         </div>
@@ -1716,9 +1784,11 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
 
       <div className="editor-body">
         <aside
+          id="editor-tools"
           className="plugin-toolbar"
+          hidden={toolsCollapsed}
           ref={toolbar}
-          onScroll={(event) => { toolbarScroll = event.currentTarget.scrollTop; }}
+          onScroll={(event) => { if (!toolsCollapsed) toolbarScroll = event.currentTarget.scrollTop; }}
           onPointerDown={(event) => event.stopPropagation()}
           onPointerMove={(event) => event.stopPropagation()}
           onWheel={(event) => event.stopPropagation()}
@@ -1726,7 +1796,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
           <button
             className={`compare-original ${showOriginal ? "active" : ""}`}
             onClick={() => { setCompare(false); setSelectingFace(false); setCropMode(false); setShowOriginal((value) => !value); }}
-            disabled={!originalImageData}
+            disabled={!originalImageData || facePreviews.active}
             title="Toggle original image (O)"
           >
             {showOriginal ? <EyeOff size={16} /> : <Eye size={16} />}
@@ -1736,6 +1806,11 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
           {ordered.map((section) => <Fragment key={section.id}>{section.node}</Fragment>)}
         </aside>
         <nav className="tool-rail" aria-label="Tools">
+          <button type="button" className="tool-panel-toggle" title={`${toolsCollapsed ? "Expand tools" : "Collapse tools"}${keyOf("panel.tools") ? ` (${keyOf("panel.tools")})` : ""}`}
+            aria-label={toolsCollapsed ? "Expand tools" : "Collapse tools"} aria-expanded={!toolsCollapsed} aria-controls="editor-tools"
+            onClick={() => setToolsCollapsed((collapsed) => !collapsed)}>
+            {toolsCollapsed ? <ChevronsRight size={19} aria-hidden="true" /> : <ChevronsLeft size={19} aria-hidden="true" />}
+          </button>
           {ordered.map(({ id, title, icon: Icon }) => (
             <button key={id} title={title} aria-label={title} draggable
               onClick={() => showSection(id)}
@@ -1748,7 +1823,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
         </nav>
       <div
         ref={viewportRef}
-        className={`editor-viewport ${stripOpen && total > 1 ? "strip-open" : ""} ${panning.current ? "panning" : ""} ${cropMode || selectingFace || compare || annotating || pickingPoint ? "selection-mode" : ""}`}
+        className={`editor-viewport ${working || saving || showOriginal || !imageData ? "system-cursor" : ""} ${stripOpen && total > 1 ? "strip-open" : ""} ${panning.current ? "panning" : ""} ${cropMode || selectingFace || compare || annotating || pickingPoint ? "selection-mode" : ""}`}
         onPointerDown={pointerDown}
         onPointerMove={pointerMove}
         onPointerUp={pointerUp}
@@ -1770,7 +1845,8 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
             }}
           >
             <div className="image-clip"><img src={imageData} style={cropMode ? { transform: `rotate(${cropAngle}deg)` } : undefined} onLoad={onImageLoad} draggable={false} alt={image.name} />{colorPreview && <img src={colorPreview} draggable={false} alt="Color adjustment preview" />}
-              {animation && !animationPaused && history.position === 0 && !maskDirty && !cropMode && !compare && !showOriginal && !colorPreview && !selectingFace
+              {facePreviews.candidate && <img src={facePreviews.candidate.src} draggable={false} alt={`Face preview: ${facePreviews.candidate.donor.split("/").at(-1)}`} />}
+              {animation && !animationPaused && history.position === 0 && !maskDirty && !cropMode && !compare && !showOriginal && !colorPreview && !selectingFace && !facePreviews.active
                 && <img className="animation-frame" src={`${convertFileSrc(image.path, "thumb")}?v=${image.size}-${image.modifiedMs}&original`} draggable={false} alt="" />}</div>
             {originalImageData && (
               <img
@@ -1785,7 +1861,7 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
               <div className="comparison-line" style={{ left: `${divider}%`, width: "calc(2px / var(--image-scale, 1))" }} />
               <input className="comparison-drag" aria-label="Before and after divider" type="range" min="0" max="100" value={divider} onChange={(e) => setDivider(+e.target.value)} onPointerDown={(e) => { if (e.button === 0 && !spaceDown.current) e.stopPropagation(); else e.preventDefault(); }} />
             </>}
-            <canvas ref={maskRef} className={showOriginal || compare || cropMode || selectingFace || adjustmentActive ? "hidden-mask" : ""} />
+            <canvas ref={maskRef} className={showOriginal || compare || cropMode || selectingFace || adjustmentActive || facePreviews.active ? "hidden-mask" : ""} />
             {cloneSource && (brushTool === "clone" || brushTool === "heal") && <span className="clone-source" style={{ left: `${cloneSource[0] * 100}%`, top: `${cloneSource[1] * 100}%`, fontSize: "calc(24px / var(--image-scale, 1))" }}>+</span>}
             {brushTool === "smart" && smartPoints.map((point, index) => <span key={index} className={`selection-point ${point[2] ? "include" : "exclude"}`} style={{ left: `${point[0] * 100}%`, top: `${point[1] * 100}%`, width: "calc(9px / var(--image-scale, 1))", height: "calc(9px / var(--image-scale, 1))", borderWidth: "calc(1px / var(--image-scale, 1))" }} />)}
             {!cropMode && annotations.map((note) => {
@@ -1838,9 +1914,9 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
             <div><kbd>Ctrl + Wheel</kbd><span>Brush size</span></div>
             <div><kbd>Space + drag / Middle drag</kbd><span>Pan</span></div>
             <div><kbd>Shift + paint</kbd><span>Paint and remove</span></div>
-            <div><kbd>Space</kbd><span>Remove masked object</span></div>
-            <div><kbd>← / →</kbd><span>Previous / next image</span></div>
-            <div><kbd>Esc</kbd><span>Back to browser</span></div>
+            <div><kbd>Space</kbd><span>Apply selected face preview, or remove masked object</span></div>
+            <div><kbd>← / →</kbd><span>Previous / next image, or face preview while comparing</span></div>
+            <div><kbd>Esc</kbd><span>Discard face previews, or back to browser</span></div>
             {SHORTCUTS.filter((shortcut) => keys[shortcut.id]).map((shortcut) => <div key={shortcut.id}><kbd>{keyLabel(keys[shortcut.id])}</kbd><span>{shortcut.label}</span></div>)}
             <small>Change these in Settings · Shortcuts.</small>
             <div><kbd>Alt + click</kbd><span>Sample clone / healing source, or exclude smart selection</span></div>
@@ -1854,6 +1930,9 @@ export default function Editor({ image, index, total, brushSize, onBrushSizeChan
           {history.position > 0 || animationPaused ? <Play size={13} /> : <Pause size={13} />}
           <span>{history.position > 0 ? (animation.editable ? `Frame 1 of ${animation.frames} · Save edits every frame` : `Frame 1 of ${animation.frames} · Saved as a still`) : `GIF · ${animation.frames} frames`}</span>
         </button>}
+        {facePreviews.active && <FacePreviewBar results={facePreviews.results} selected={facePreviews.selected} busy={facePreviews.busy}
+          accepting={acceptingFacePreview} progress={facePreviews.progress} errors={facePreviews.errors}
+          onSelect={facePreviews.select} onMove={facePreviews.move} previousKey={keyOf("editor.previous")} nextKey={keyOf("editor.next")} onAccept={() => void acceptFacePreview()} onDiscard={facePreviews.discard} onStop={facePreviews.stop} />}
         {message && <div className={`toast ${message.includes("failed") ? "error" : ""}`}>{message}</div>}
       </div>
         <div className="right-dock">

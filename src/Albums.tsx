@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { ChevronRight, FolderPlus, Image as ImageIcon, MoreVertical, Pencil, Search, Trash2, Undo2, X } from "lucide-react";
+import { ChevronRight, Download, FolderPlus, Image as ImageIcon, MoreVertical, Pencil, Search, Sparkles, Trash2, Undo2, X } from "lucide-react";
 import type { Album } from "./types";
 import { storage } from "./storage";
+import SmartAlbumDialog from "./SmartAlbumDialog";
+import type { SmartRules } from "./smartAlbums";
 
 // Which albums are unfolded, per store, so the tree looks the same after a picture was edited.
 const OPEN_ALBUMS = "inpaint.albumsOpen";
@@ -29,6 +31,8 @@ function writeOpen(storeId: string, ids: Set<string>) {
 
 /** The store's albums and everything the sidebar and the gallery menus do with them. */
 export type AlbumView = {
+  tagNames?: string[];
+  onSaveSmart?: (id: string | null, name: string, rules: SmartRules) => void;
   storeId: string;
   /** Where pictures dragged from another program would go: an album's id, "" for the store, null when none is. */
   windowDrop?: string | null;
@@ -45,6 +49,7 @@ export type AlbumView = {
   onMove: (album: Album, parentId: string) => void;
   onSetCover: (album: Album, path: string) => void;
   onDelete: (album: Album) => void;
+  onExport: (album: Album) => void;
   onAddPictures: (album: Album, paths: string[]) => void;
   onRemovePictures: (album: Album, paths: string[]) => void;
 };
@@ -69,7 +74,7 @@ const childrenOf = (albums: Album[], parentId: string) =>
 
 /** Every album as one flat list with its depth, for the menus that add pictures. */
 export function albumOptions(albums: Album[], parentId = "", depth = 0): { album: Album; depth: number }[] {
-  return childrenOf(albums, parentId).flatMap((album) => [{ album, depth }, ...albumOptions(albums, album.id, depth + 1)]);
+  return childrenOf(albums, parentId).filter((album) => !album.smartRules).flatMap((album) => [{ album, depth }, ...albumOptions(albums, album.id, depth + 1)]);
 }
 
 const coverUrl = (path: string) => `${convertFileSrc(path, "thumb")}?v=cover`;
@@ -173,9 +178,10 @@ type RowProps = {
   onToggle: (id: string) => void;
   onRename: (album: Album) => void;
   onNewInside: (album: Album) => void;
+  onEditSmart: (album: Album) => void;
 };
 
-function AlbumRow({ album, albums, view, depth, open, found, onToggle, onRename, onNewInside }: RowProps) {
+function AlbumRow({ album, albums, view, depth, open, found, onToggle, onRename, onNewInside, onEditSmart }: RowProps) {
   // The menu hangs outside the scrolling tree, so it is placed against the window instead.
   const [menuAt, setMenuAt] = useState<{ left: number; top: number } | null>(null);
   const menuOpen = menuAt !== null;
@@ -200,8 +206,9 @@ function AlbumRow({ album, albums, view, depth, open, found, onToggle, onRename,
 
   // Pictures dropped from the gallery join the album; an album dropped on it moves inside.
   const accepts = (event: React.DragEvent) =>
-    (event.dataTransfer.types.includes(PICTURE_DRAG) && !album.isVirtual) || (!view.immich && event.dataTransfer.types.includes(ALBUM_DRAG));
+    !album.smartRules && ((event.dataTransfer.types.includes(PICTURE_DRAG) && !album.isVirtual) || (!view.immich && event.dataTransfer.types.includes(ALBUM_DRAG)));
   const drop = (event: React.DragEvent) => {
+    if (!accepts(event)) return;
     event.preventDefault();
     event.stopPropagation();
     setDropping(false);
@@ -220,10 +227,10 @@ function AlbumRow({ album, albums, view, depth, open, found, onToggle, onRename,
   return <div className="album-node">
     <div
       ref={row}
-      data-album-id={album.id}
+      data-album-id={album.smartRules ? undefined : album.id}
       className={`album-row ${selected ? "selected" : ""} ${dropping || view.windowDrop === album.id ? "dropping" : ""} ${menuOpen ? "menu-open" : ""}`}
       style={{ paddingLeft: 8 + depth * 14 }}
-      draggable={!view.immich && !album.isVirtual}
+      draggable={!view.immich && !album.isVirtual && !album.smartRules}
       onDragStart={(event) => { event.dataTransfer.setData(ALBUM_DRAG, album.id); event.dataTransfer.effectAllowed = "move"; }}
       onDragOver={(event) => { if (accepts(event)) { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; setDropping(true); } }}
       onDragLeave={() => setDropping(false)}
@@ -242,6 +249,7 @@ function AlbumRow({ album, albums, view, depth, open, found, onToggle, onRename,
           : <ImageIcon size={14} />}
       </span>
       <span className="album-name" title={album.name}>{album.name}</span>
+      {album.smartRules && <Sparkles size={13} className="smart-album-mark" aria-label="Smart album" />}
       {/* The count and the actions share one slot: the dots take its place while the row is hovered. */}
       <span className="album-end">
       <span className="album-count">{album.total.toLocaleString()}</span>
@@ -250,14 +258,17 @@ function AlbumRow({ album, albums, view, depth, open, found, onToggle, onRename,
           event.stopPropagation();
           if (menuOpen) { setMenuAt(null); return; }
           const box = event.currentTarget.getBoundingClientRect();
-          setMenuAt({ left: Math.min(box.right - 232, window.innerWidth - 240), top: Math.min(box.bottom + 4, window.innerHeight - 200) });
+          setMenuAt({ left: Math.max(8, Math.min(box.right - 232, window.innerWidth - 240)), top: Math.max(8, Math.min(box.bottom + 4, window.innerHeight - 280)) });
         }}><MoreVertical size={14} /></button>
       </span>
       {menuAt && <div className="album-menu" role="menu" style={menuAt} onClick={(event) => event.stopPropagation()}>
+        <button role="menuitem" onClick={() => { setMenuOpen(false); view.onExport(album); }}><Download size={14} /> Export to folder…</button>
         {/* Renaming a grouping album renames the part in every album below it, as its name holds it. */}
         <button role="menuitem" onClick={() => { setMenuOpen(false); onRename(album); }}><Pencil size={14} /> Rename…</button>
-        <button role="menuitem" onClick={() => { setMenuOpen(false); onNewInside(album); }}><FolderPlus size={14} /> New album inside…</button>
-        {!view.immich && <>
+        {album.smartRules
+          ? <button role="menuitem" onClick={() => { setMenuOpen(false); onEditSmart(album); }}><Sparkles size={14} /> Edit rules…</button>
+          : <button role="menuitem" onClick={() => { setMenuOpen(false); onNewInside(album); }}><FolderPlus size={14} /> New album inside…</button>}
+        {!view.immich && !album.smartRules && <>
           {album.coverPath && <button role="menuitem" onClick={() => { setMenuOpen(false); view.onSetCover(album, ""); }}><Undo2 size={14} /> Use the newest picture as cover</button>}
           {album.parentId && <button role="menuitem" onClick={() => { setMenuOpen(false); view.onMove(album, ""); }}><Undo2 size={14} /> Move to the top</button>}
         </>}
@@ -267,7 +278,7 @@ function AlbumRow({ album, albums, view, depth, open, found, onToggle, onRename,
       </div>}
     </div>
     {expanded && children.map((child) => (
-      <AlbumRow key={child.id} album={child} albums={albums} view={view} depth={depth + 1} open={open} found={found} onToggle={onToggle} onRename={onRename} onNewInside={onNewInside} />
+      <AlbumRow key={child.id} album={child} albums={albums} view={view} depth={depth + 1} open={open} found={found} onToggle={onToggle} onRename={onRename} onNewInside={onNewInside} onEditSmart={onEditSmart} />
     ))}
   </div>;
 }
@@ -279,6 +290,7 @@ export default function AlbumsPanel({ view }: { view: AlbumView }) {
   const [dialog, setDialog] = useState<{ kind: "create"; parentId: string } | { kind: "rename"; album: Album } | null>(null);
   const [droppingRoot, setDroppingRoot] = useState(false);
   const [query, setQuery] = useState("");
+  const [smartDialog, setSmartDialog] = useState<{ album?: Album } | null>(null);
 
   // Searching keeps the albums whose name matches, with the albums holding them as the way there.
   const found = useMemo(() => {
@@ -319,6 +331,7 @@ export default function AlbumsPanel({ view }: { view: AlbumView }) {
   return <div className="albums-panel">
     <div className="albums-actions">
       <button onClick={() => setDialog({ kind: "create", parentId: "" })}><FolderPlus size={14} /> New album</button>
+      {view.onSaveSmart && <button onClick={() => setSmartDialog({})}><Sparkles size={14} /> Smart album</button>}
       {view.selected && <button onClick={() => view.onSelect(null)}><X size={14} /> Show all</button>}
     </div>
     {view.albums.length > 6 && <label className="album-search">
@@ -345,12 +358,14 @@ export default function AlbumsPanel({ view }: { view: AlbumView }) {
           ? roots.map((album) => (
               <AlbumRow key={album.id} album={album} albums={view.albums} view={view} depth={0} open={open} found={found} onToggle={toggle}
                 onRename={(target) => setDialog({ kind: "rename", album: target })}
-                onNewInside={(target) => setDialog({ kind: "create", parentId: target.id })} />
+                onNewInside={(target) => setDialog({ kind: "create", parentId: target.id })} onEditSmart={(album) => setSmartDialog({ album })} />
             ))
           : found
             ? <div className="sidebar-empty">No album matches “{query.trim()}”.</div>
             : <div className="sidebar-empty">No albums yet. Create one, then drop pictures on it or use a picture's right-click menu.</div>}
     </div>
     {dialogNode}
+    {smartDialog && <SmartAlbumDialog initial={smartDialog.album} tags={view.tagNames ?? []} immich={view.immich}
+      onClose={() => setSmartDialog(null)} onSave={(name, rules) => view.onSaveSmart?.(smartDialog.album?.id ?? null, name, rules)} />}
   </div>;
 }

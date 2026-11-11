@@ -5,16 +5,21 @@ import { confirm, open } from "@tauri-apps/plugin-dialog";
 import BrowserView, { type StoreView } from "./Browser";
 import Filmstrip, { type ViewportBox } from "./Filmstrip";
 import type { AlbumView } from "./Albums";
+import AlbumExportDialog from "./AlbumExportDialog";
+import { albumExportRequest, type AlbumExportRequest } from "./albumExport";
 import { taggedWith, type TagView } from "./Tags";
 import type { DuplicateGroupView, DuplicateLevel, DuplicateProgress, Duplicates, DuplicateView } from "./Duplicates";
 import { resolveDuplicateSelection, splitIgnoredDuplicateGroups, withoutDeletedDuplicates, type DuplicateDeletion } from "./duplicateActions";
 import { SettingsDialog, type SettingsTab } from "./Settings";
-import { FACE_SOURCE_PREFERENCE, usePreference } from "./preferences";
-import Editor, { type FaceSwapSource } from "./Editor";
+import { usePreference } from "./preferences";
+import Editor from "./Editor";
+import { useStoreFaces } from "./useStoreFaces";
+import { randomOrder } from "./randomOrder";
 import { useServerBridge, type LoadRequest } from "./serverApi";
 import { DEFAULT_GALLERY_ORDER, type Album, type DirectoryContents, type GalleryOrder, type ImageEntry, type PictureFacts, type Store, type StoreContents, type StoreStats } from "./types";
 import { storage } from "./storage";
 import { HiddenDialog, type HiddenStatus } from "./HiddenDialog";
+import { matchesSmartAlbum, smartAlbumView, validSmartAlbums, type SmartAlbum } from "./smartAlbums";
 
 // Immich's album covers are assets, whose file in the store folder is looked up once per session.
 const immichCovers = new Map<string, string>();
@@ -58,21 +63,12 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [editorIndex, setEditorIndex] = useState<number | null>(null);
   const [brushSize, setBrushSize] = usePreference("inpaint.brushSize", 54, (value) => value >= 3 && value <= 500);
-  const [faceSwapSource, setFaceSwapSource] = useState<FaceSwapSource | null>(null);
-  const [faceSourcePath, setFaceSourcePath] = usePreference(FACE_SOURCE_PREFERENCE, "");
-  useEffect(() => {
-    if (!faceSourcePath || faceSwapSource?.path === faceSourcePath) return;
-    let active = true;
-    void invoke<string>("read_image_data", { path: faceSourcePath }).then((data) => {
-      if (active) setFaceSwapSource({ path: faceSourcePath, data });
-    }).catch(() => { if (active) setFaceSourcePath(""); });
-    return () => { active = false; };
-  }, [faceSourcePath]);
   const galleryScrollPositions = useRef(new Map<string, number>());
 
   // Image stores: the gallery shows either a folder or every picture of one store.
   const [stores, setStores] = useState<Store[]>([]);
   const [storeId, setStoreId] = useState<string | null>(() => storage.getItem("inpaint.store"));
+  const storeFaces = useStoreFaces(storeId);
   const [storeStats, setStoreStats] = useState<StoreStats | null>(null);
   const [storeProgress, setStoreProgress] = useState<{ done: number; total: number } | null>(null);
   const [storeError, setStoreError] = useState("");
@@ -92,7 +88,17 @@ export default function App() {
   const [albums, setAlbums] = useState<Album[]>([]);
   const [albumsLoading, setAlbumsLoading] = useState(false);
   const [albumError, setAlbumError] = useState("");
+  const [albumExport, setAlbumExport] = useState<AlbumExportRequest | null>(null);
   const [albumId, setAlbumId] = useState<string | null>(null);
+  const [smartAlbums, setSmartAlbums] = usePreference<SmartAlbum[]>("inpaint.smartAlbums", [], validSmartAlbums);
+  const [smartAlbumId, setSmartAlbumId] = useState<string | null>(null);
+  const selectedSmart = smartAlbums.find((album) => album.id === smartAlbumId && album.storeId === storeId);
+  const [smartNow, setSmartNow] = useState(Date.now);
+  useEffect(() => {
+    if (!smartAlbums.some((album) => album.storeId === storeId && album.rules.addedDays)) return;
+    const timer = window.setInterval(() => setSmartNow(Date.now()), 60000);
+    return () => window.clearInterval(timer);
+  }, [smartAlbums, storeId]);
   const [albumPaths, setAlbumPaths] = useState<Set<string> | null>(null);
   // The album's pictures as full paths, which for Immich may lie in an external library outside the store.
   const [albumFiles, setAlbumFiles] = useState<string[]>([]);
@@ -159,7 +165,8 @@ export default function App() {
   // The gallery's order and the pictures it leaves out; favourites and ratings come with the pictures'
   // facts, read for the open store or folder.
   const [order, setOrder] = usePreference<GalleryOrder>("inpaint.galleryOrder", DEFAULT_GALLERY_ORDER,
-    (value) => ["modified", "added", "rating", "name"].includes(value.by));
+    (value) => ["modified", "added", "rating", "name", "random"].includes(value.by)
+      && Number.isInteger(value.randomSeed) && value.randomSeed >= 0 && value.randomSeed <= 0xffffffff);
   const [facts, setFacts] = useState<Record<string, PictureFacts>>({});
   const factsRequest = useRef(0);
   const loadFacts = useCallback(async (storeId: string | null, folder: string | null, refresh: boolean) => {
@@ -185,28 +192,31 @@ export default function App() {
     })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storeId, currentPath, !!factsStore, factsImmich, loadFacts]);
+  const smartViews = useMemo(() => smartAlbums.filter((album) => album.storeId === storeId)
+    .map((album) => smartAlbumView(album, images, tagsByPath, facts, smartNow)), [smartAlbums, storeId, images, tagsByPath, facts, smartNow]);
   const { shown, leftOut } = useMemo(() => {
-    let inside = tagFilter ? images.filter((image) => taggedWith(tagsByPath[image.path], tagFilter))
+    let inside = selectedSmart ? images.filter((image) => matchesSmartAlbum(image, selectedSmart.rules, tagsByPath[image.path], facts[image.path], smartNow))
+      : tagFilter ? images.filter((image) => taggedWith(tagsByPath[image.path], tagFilter))
       : albumPaths ? images.filter((image) => albumPaths.has(layoutKey(image.path)))
       : images;
     if (outside.length && (tagFilter || albumPaths)) inside = [...inside, ...outside];
     // Leaving out pictures in albums, or tagged ones, only means something while every picture is shown.
-    const everything = !!storeId && !tagFilter && !albumPaths;
+    const everything = !!storeId && !tagFilter && !albumPaths && !selectedSmart;
     const filtered = inside.filter((image) =>
       (order.notFavorites || facts[image.path]?.favorite)
-      && (order.tagged || tagFilter || !tagsByPath[image.path]?.length)
+      && (order.tagged || tagFilter || selectedSmart || !tagsByPath[image.path]?.length)
       && (order.inAlbums || !everything || !albumsByPath[image.path]?.length));
     const added = (image: ImageEntry) => facts[image.path]?.addedMs ?? image.addedMs ?? image.modifiedMs;
     const key: (image: ImageEntry) => number = order.by === "added" ? added
       : order.by === "rating" ? (image) => facts[image.path]?.rating ?? 0
       : (image) => image.modifiedMs;
     const direction = order.descending ? -1 : 1;
-    const sorted = filtered.sort((a, b) => order.by === "name"
+    const sorted = order.by === "random" ? randomOrder(filtered, order.randomSeed) : filtered.sort((a, b) => order.by === "name"
       ? direction * a.name.localeCompare(b.name, undefined, { numeric: true })
       // Pictures that tie, such as those of one rating, stay newest first.
       : direction * (key(a) - key(b)) || b.modifiedMs - a.modifiedMs || a.name.localeCompare(b.name));
     return { shown: sorted, leftOut: inside.length - sorted.length };
-  }, [images, albumPaths, tagFilter, tagsByPath, outside, order, facts, storeId, albumsByPath]);
+  }, [images, albumPaths, tagFilter, tagsByPath, outside, order, facts, storeId, albumsByPath, selectedSmart, smartNow]);
 
   // Each group's pictures still in the store, the one to keep first: the biggest, then one with tags or
   // albums, then a favourite or the better rated, then the bigger file, then the older one.
@@ -416,6 +426,7 @@ export default function App() {
   }, [resolveCovers]);
 
   const selectAlbum = useCallback(async (store: Store, id: string | null) => {
+    setSmartAlbumId(null);
     const request = ++albumRequest.current;
     setAlbumId(id);
     // Choosing an album leaves whatever tag was chosen; the two never narrow each other.
@@ -693,6 +704,7 @@ export default function App() {
   // Albums are read again whenever another store opens, or one starts or stops using Immich's albums.
   const albumSource = activeStore ? `${activeStore.id}:${activeStore.immich}` : "";
   useEffect(() => {
+    setSmartAlbumId(null);
     setAlbums([]);
     setAlbumId(null);
     setAlbumPaths(null);
@@ -782,6 +794,7 @@ export default function App() {
     error: tagError,
     refreshable: !!activeStore?.immich,
     onSelect: (name) => {
+      setSmartAlbumId(null);
       setTagFilter(name);
       if (name) {
         albumRequest.current += 1;
@@ -964,19 +977,45 @@ export default function App() {
   const albumView: AlbumView = {
     storeId: activeStore?.id ?? "",
     windowDrop,
-    albums,
-    selected: albums.find((album) => album.id === albumId) ?? null,
+    albums: [...albums, ...smartViews],
+    selected: smartViews.find((album) => album.id === smartAlbumId) ?? albums.find((album) => album.id === albumId) ?? null,
+    tagNames,
+    onSaveSmart: (id, name, rules) => {
+      if (!activeStore) return;
+      const key = id ?? `smart:${crypto.randomUUID()}`;
+      setSmartAlbums((current) => id ? current.map((album) => album.id === id ? { ...album, name, rules } : album)
+        : [...current, { id: key, name, rules, storeId: activeStore.id, createdMs: Date.now() }]);
+      albumRequest.current += 1;
+      setAlbumId(null); setAlbumPaths(null); setTagFilter(""); setSmartAlbumId(key); setSmartNow(Date.now());
+    },
     loading: albumsLoading,
     error: albumError,
     immich: !!activeStore?.immich,
-    onSelect: (id) => { if (activeStore) void selectAlbum(activeStore, id); },
+    onSelect: (id) => {
+      if (id && smartViews.some((album) => album.id === id)) {
+        albumRequest.current += 1;
+        setAlbumId(null); setAlbumPaths(null); setTagFilter(""); setSmartAlbumId(id); setSmartNow(Date.now());
+      } else if (activeStore) void selectAlbum(activeStore, id);
+    },
     onCreate: (name, parentId, paths) => { if (activeStore) void createAlbum(activeStore, name, parentId, paths); },
-    onRename: (album, name) => { if (activeStore) void changeAlbums(activeStore, () => renameAlbum(activeStore, album, name)); },
-    onMove: (album, parentId) => { if (activeStore) void changeAlbums(activeStore, () => invoke("album_move", { id: album.id, parentId })); },
-    onSetCover: (album, path) => { if (activeStore) void changeAlbums(activeStore, () => (activeStore.immich ? invoke("immich_album_set_cover", { storeId: activeStore.id, albumId: album.id, path }) : invoke("album_set_cover", { id: album.id, path }))); },
-    onDelete: (album) => { if (activeStore) void deleteAlbum(activeStore, album); },
-    onAddPictures: (album, paths) => { if (activeStore) void setAlbumPictures(activeStore, album, paths, true); },
-    onRemovePictures: (album, paths) => { if (activeStore) void setAlbumPictures(activeStore, album, paths, false); },
+    onExport: (album) => {
+      if (!activeStore) return;
+      setAlbumExport(albumExportRequest(album, activeStore, images, tagsByPath, facts));
+    },
+    onRename: (album, name) => {
+      if (album.smartRules) setSmartAlbums((current) => current.map((item) => item.id === album.id ? { ...item, name } : item));
+      else if (activeStore) void changeAlbums(activeStore, () => renameAlbum(activeStore, album, name));
+    },
+    onMove: (album, parentId) => { if (activeStore && !album.smartRules) void changeAlbums(activeStore, () => invoke("album_move", { id: album.id, parentId })); },
+    onSetCover: (album, path) => { if (activeStore && !album.smartRules) void changeAlbums(activeStore, () => (activeStore.immich ? invoke("immich_album_set_cover", { storeId: activeStore.id, albumId: album.id, path }) : invoke("album_set_cover", { id: album.id, path }))); },
+    onDelete: (album) => {
+      if (album.smartRules) {
+        setSmartAlbums((current) => current.filter((item) => item.id !== album.id));
+        if (smartAlbumId === album.id) setSmartAlbumId(null);
+      } else if (activeStore) void deleteAlbum(activeStore, album);
+    },
+    onAddPictures: (album, paths) => { if (activeStore && !album.smartRules) void setAlbumPictures(activeStore, album, paths, true); },
+    onRemovePictures: (album, paths) => { if (activeStore && !album.smartRules) void setAlbumPictures(activeStore, album, paths, false); },
   };
 
   /** Deletes pictures from the gallery: Immich's trash inside a compatible store, the desktop's otherwise. */
@@ -1056,9 +1095,11 @@ export default function App() {
   const editorProps = {
     brushSize,
     onBrushSizeChange: setBrushSize,
-    faceSwapSource,
-    onFaceSwapSourceChange: (source: FaceSwapSource) => { setFaceSwapSource(source); setFaceSourcePath(source.path); },
-    onFaceSwapSourceClear: () => { setFaceSwapSource(null); setFaceSourcePath(""); },
+    faceSwapSource: storeFaces.source,
+    faceLibrary: storeFaces.paths,
+    onFaceLibraryChange: storeFaces.setPaths,
+    onFaceSwapSourceChange: storeFaces.selectSource,
+    onFaceSwapSourceClear: storeFaces.clearSource,
     onSaved: (path: string) => { savedPaths.current.add(path); },
     immichStores: stores.filter((store) => store.immich),
     // After deleting, the editor moves on to the next picture, or back to the gallery after the last one.
@@ -1098,7 +1139,7 @@ export default function App() {
       <>
       <Editor
         {...editorProps}
-        key={`loaded-${loaded.id}`}
+        key={`loaded-${loaded.id}:${storeId ?? "folders"}`}
         image={{ name: loaded.name, path: loaded.path, extension: loaded.name.split(".").at(-1)?.toLowerCase() ?? "png", size: 0, modifiedMs: 0 }}
         initialData={loaded.data}
         index={0}
@@ -1122,7 +1163,7 @@ export default function App() {
       <Editor
         {...editorProps}
         // One editor for the whole gallery: it opens each picture itself, keeping its panels in place.
-        key="gallery-editor"
+        key={`gallery-editor:${storeId ?? "folders"}`}
         image={current}
         index={editorIndex}
         total={editorList.length}
@@ -1178,7 +1219,7 @@ export default function App() {
     },
     onRescan: () => { if (storeId) void scanStore(storeId); },
   };
-  const viewKey = storeId && storeView.active ? `store:${storeId}${albumId ? `/album:${albumId}` : ""}${tagFilter ? `/tag:${tagFilter}` : ""}` : currentPath;
+  const viewKey = storeId && storeView.active ? `store:${storeId}${smartAlbumId || albumId ? `/album:${smartAlbumId || albumId}` : ""}${tagFilter ? `/tag:${tagFilter}` : ""}` : currentPath;
 
   return (
     <>
@@ -1189,7 +1230,7 @@ export default function App() {
       loading={loading}
       order={order}
       onOrder={setOrder}
-      orderChoices={{ tagged: !!storeId && !tagFilter, inAlbums: !!storeId && !tagFilter && !albumId }}
+      orderChoices={{ tagged: !!storeId && !tagFilter && !selectedSmart, inAlbums: !!storeId && !tagFilter && !albumId && !selectedSmart }}
       leftOut={leftOut}
       facts={facts}
       store={storeView}
@@ -1207,6 +1248,7 @@ export default function App() {
       }}
     />
     {settingsDialog}
+    {albumExport && <AlbumExportDialog request={albumExport} onClose={() => setAlbumExport(null)} />}
     </>
   );
 }

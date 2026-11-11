@@ -8,6 +8,7 @@ export type BrushSettings = { hardness: number; opacity: number; feather: number
 export type Edges = { shrink: number; soften: number; decontaminate: number };
 export type Extension = { left: number; right: number; top: number; bottom: number; model: string; prompt: string };
 type Props = {
+  refineKey?: string; extendKey?: string;
   busy: boolean; tool: BrushTool; onTool: (tool: BrushTool) => void; brush: BrushSettings; setBrush: (value: BrushSettings) => void;
   size: number; setSize: (value: number) => void; maskDirty: boolean; refineMask: () => void; resetPoints: () => void; pointCount: number;
   sourceSet: boolean; adjustmentActive: boolean; adjustments: Adjustments; onAdjust: (value: Adjustments) => void; onStartAdjust: () => void; onApplyAdjust: () => void; onCancelAdjust: () => void;
@@ -33,7 +34,7 @@ export default function advancedSections(p: Props & SectionProps): SectionEntry[
       {(p.tool === "clone" || p.tool === "heal") && <div className="plugin-description">Alt-click to sample a source, then paint the destination. {p.sourceSet ? "Source selected." : "Choose a source point."} {p.tool === "heal" && "Healing matches local color and lighting."}</div>}
       <Slider label="Grow / shrink mask" value={p.brush.grow} onChange={(grow) => p.setBrush({ ...p.brush, grow })} min={-32} max={32} suffix=" px" disabled={p.busy} />
       <Slider label="Feather mask" value={p.brush.feather} onChange={(feather) => p.setBrush({ ...p.brush, feather })} max={32} suffix=" px" disabled={p.busy} />
-      <button className="plugin-run" disabled={p.busy || !p.maskDirty} onClick={p.refineMask}>Refine selection edges</button>
+      <button className="plugin-run" disabled={p.busy || !p.maskDirty} onClick={p.refineMask}>Refine selection edges{p.refineKey && <kbd className="action-shortcut">{p.refineKey}</kbd>}</button>
     </div></ToolSection> },
     { id: "color", title: "Color and lighting", icon: Palette, node:
     <ToolSection id="color" title="Color and lighting" icon={Palette} defaultOpen={false} openSignal={p.openSignal("color")} onMove={p.onMove}><div className="advanced-content">
@@ -51,7 +52,7 @@ export default function advancedSections(p: Props & SectionProps): SectionEntry[
       <textarea aria-label="Outpainting prompt" disabled={p.busy} placeholder="Describe the new surroundings (SDXL)…" value={p.extension.prompt} onChange={(e) => p.setExtension({ ...p.extension, prompt: e.target.value })} />
       <div className="plugin-description">The existing image stays intact. SDXL follows the prompt; other models continue nearby textures.</div>
       <div className="plugin-figure">Output: {p.width + p.extension.left + p.extension.right} × {p.height + p.extension.top + p.extension.bottom} px</div>
-      <button className="plugin-run" disabled={p.busy || p.adjustmentActive || ![p.extension.left, p.extension.right, p.extension.top, p.extension.bottom].some(Boolean)} onClick={p.onExtend}>Generate extended image</button>
+      <button className="plugin-run" disabled={p.busy || p.adjustmentActive || ![p.extension.left, p.extension.right, p.extension.top, p.extension.bottom].some(Boolean)} onClick={p.onExtend}>Generate extended image{p.extendKey && <kbd className="action-shortcut">{p.extendKey}</kbd>}</button>
     </div></ToolSection> },
   ];
 }

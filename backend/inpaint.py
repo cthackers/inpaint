@@ -291,7 +291,7 @@ def worker_main(models_dir: Path) -> None:
                 respond({"ok": True, "memory": memory})
                 continue
 
-            if command in {"detect_faces", "face_preview"}:
+            if command in {"detect_faces", "face_preview", "prepare_face_previews"}:
                 options = request.get("options", {})
                 if command == "face_preview" and not options.get("donor"):
                     raise ValueError("Select a source photo first.")
@@ -302,6 +302,9 @@ def worker_main(models_dir: Path) -> None:
                 else:
                     if "gfpgan" not in plugins:
                         plugins["gfpgan"] = load_plugin("gfpgan", "gfpgan")[0]
+                    if command == "prepare_face_previews":
+                        respond({"ok": True})
+                        continue
                     plugins["face_swap"].replace(Path(request["input"]), Path(options["donor"]),
                         Path(request["output"]), plugins["gfpgan"], strength=options.get("strength", 1),
                         target_point=options.get("target"), raw_output=Path(request["raw_output"]), color_match=options.get("colorMatch", 0))

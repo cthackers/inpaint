@@ -48,6 +48,8 @@ export type StoreContents = {
 
 /** An album of an image store: ours from `inpaint.db`, or one of Immich's for a compatible store. */
 export type Album = {
+  /** A local, automatically populated album; never a manual destination for pictures. */
+  smartRules?: import("./smartAlbums").SmartRules;
   id: string;
   storeId: string;
   /** The album holding this one, empty at the top level. Always empty for Immich albums. */
@@ -71,7 +73,9 @@ export type PictureFacts = { favorite: boolean; rating: number; addedMs?: number
 
 /** How the gallery orders pictures and which it leaves out. */
 export type GalleryOrder = {
-  by: "modified" | "added" | "rating" | "name";
+  by: "modified" | "added" | "rating" | "name" | "random";
+  /** Saved so edits, filtering and restarts preserve the random order until explicitly shuffled. */
+  randomSeed: number;
   descending: boolean;
   /** Unticked, pictures that carry a tag are left out. */
   tagged: boolean;
@@ -80,4 +84,4 @@ export type GalleryOrder = {
   /** Unticked, only favourites are shown. */
   notFavorites: boolean;
 };
-export const DEFAULT_GALLERY_ORDER: GalleryOrder = { by: "modified", descending: true, tagged: true, inAlbums: true, notFavorites: true };
+export const DEFAULT_GALLERY_ORDER: GalleryOrder = { by: "modified", randomSeed: 0, descending: true, tagged: true, inAlbums: true, notFavorites: true };

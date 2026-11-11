@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { executeOperation, imageAction, loadImage, RESIZE_FILTERS, WATERMARK_PROMPTS, watermarkPrompts, RESTORE_MODES, RESTORMER_MODES, type Adjustments, type Operation, type Plugin, type Rect, type ResizeFilter } from "./editorOperations";
 import { INPAINT_MODELS } from "./models";
-import { FACE_SOURCE_PREFERENCE } from "./preferences";
+import { faceCollectionFor, faceScope, readFaceCollections } from "./faceCollections";
 import { storage } from "./storage";
 
 /** A request forwarded by the local API server (src-tauri/src/server.rs). */
@@ -293,10 +293,8 @@ const slug = (name: string) => name.toLowerCase().replace(/[^a-z0-9]+/g, "-").re
 
 // The face swap source chosen in the editor, which App stores as a preference.
 function savedFaceSourcePath(): string {
-  try {
-    const saved: unknown = JSON.parse(storage.getItem(FACE_SOURCE_PREFERENCE) ?? "\"\"");
-    return typeof saved === "string" ? saved : "";
-  } catch { return ""; }
+  const storeId = storage.getItem("inpaint.store");
+  return faceCollectionFor(readFaceCollections(storage, storeId), faceScope(storeId)).sourcePath;
 }
 
 async function faceSource() {

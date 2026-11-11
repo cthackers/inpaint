@@ -45,7 +45,7 @@ const noop = () => {};
 const open = (path: string) => flushSync(() => root.render(<Editor
   image={{ path, name: path, extension: "png", size: 0, modifiedMs: 0 }}
   index={0} total={3} brushSize={20} onBrushSizeChange={noop}
-  faceSwapSource={null} onFaceSwapSourceChange={noop} onFaceSwapSourceClear={noop}
+  faceLibrary={[]} onFaceLibraryChange={noop} faceSwapSource={null} onFaceSwapSourceChange={noop} onFaceSwapSourceClear={noop}
   onExit={noop} onNavigate={noop}
 />));
 const picture = () => document.querySelector<HTMLImageElement>(".image-clip > img");

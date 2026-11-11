@@ -811,33 +811,38 @@ fn real_album(album_id: &str) -> Result<&str, String> {
 /// The pictures of an Immich album as paths in the store folder, gathering every album below a grouping
 /// album. Assets kept elsewhere are left out by the gallery, which only shows pictures it scanned.
 #[tauri::command]
-pub async fn immich_album_pictures(store_id: String, album_id: String) -> Result<Vec<String>, String> {
+pub async fn immich_album_pictures(store_id: String, album_id: String, include_unavailable: Option<bool>) -> Result<Vec<String>, String> {
     blocking(move || {
         let (store, settings) = store_and_settings(&store_id)?;
-        let ids: Vec<String> = match grouping_prefix(&album_id) {
-            Some(prefix) => {
-                let albums = send(&settings, "GET", "/api/albums", None)?;
-                albums
-                    .as_array()
-                    .map(Vec::as_slice)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|album| album["albumName"].as_str().is_some_and(|name| inside(name.trim().trim_matches('/'), prefix)))
-                    .filter_map(|album| album["id"].as_str().map(str::to_string))
-                    .collect()
-            }
-            None => vec![checked_id(&album_id)?.to_string()],
-        };
-        let mut paths = Vec::new();
-        for id in ids {
-            let originals = album_originals(&settings, checked_id(&id)?)?;
-            paths.extend(originals.iter().filter_map(|original| store_path(&store, original)));
-        }
-        paths.sort();
-        paths.dedup();
-        Ok(paths)
+        album_picture_paths(&store, &settings, &album_id, include_unavailable.unwrap_or(false))
     })
     .await
+}
+
+fn album_picture_paths(store: &Store, settings: &ImmichSettings, album_id: &str, include_unavailable: bool) -> Result<Vec<String>, String> {
+    let ids: Vec<String> = match grouping_prefix(album_id) {
+        Some(prefix) => {
+            let albums = send(settings, "GET", "/api/albums", None)?;
+            albums
+                .as_array()
+                .ok_or("Immich did not list the albums.")?
+                .iter()
+                .filter(|album| album["albumName"].as_str().is_some_and(|name| inside(name.trim().trim_matches('/'), prefix)))
+                .filter_map(|album| album["id"].as_str().map(str::to_string))
+                .collect()
+        }
+        None => vec![checked_id(album_id)?.to_string()],
+    };
+    let mut paths = Vec::new();
+    for id in ids {
+        let originals = album_originals(settings, checked_id(&id)?)?;
+        // Export must report unmounted originals as failures rather than silently omit them.
+        paths.extend(originals.iter().filter_map(|original| store_path(store, original)
+            .or_else(|| include_unavailable.then(|| original.clone()))));
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 /// Where an album's cover asset lies in the store folder, for the sidebar's thumbnail.
@@ -1300,6 +1305,34 @@ mod tests {
         assert_eq!(store_path(&store, "abcd.jpg"), None);
         // Only the upload layout is read that way; a library folder is not taken for one.
         assert_eq!(upload_path(&store, "/mnt/photos/Trips/2023/IMG_1.jpg"), None);
+    }
+
+    #[test]
+    fn album_export_includes_nested_albums_and_reports_unmounted_originals() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("unmounted/photo.jpg").to_string_lossy().into_owned();
+        let nested = serde_json::to_vec(&json!({"assets":{"items":[
+            {"originalPath":"/upload/ab/cd/abcd.jpg"}, {"originalPath": missing}
+        ],"nextPage":null}})).unwrap();
+        let (base, server) = serve(vec![
+            answer("200 OK", &[], br#"[
+                {"id":"11111111-1111-1111-1111-111111111111","albumName":"Trips"},
+                {"id":"22222222-2222-2222-2222-222222222222","albumName":"Trips/Rome"},
+                {"id":"33333333-3333-3333-3333-333333333333","albumName":"TripsPlus"}
+            ]"#),
+            answer("200 OK", &[], br#"{"assets":{"items":[{"originalPath":"/upload/ab/cd/abcd.jpg"}],"nextPage":null}}"#),
+            answer("200 OK", &[], &nested),
+        ]);
+        let store = Store { path: "/pictures".into(), immich_path: "/upload/".into(), ..Default::default() };
+        let paths = album_picture_paths(&store, &settings(base), "path:Trips", true).unwrap();
+        assert_eq!(paths.len(), 2, "shared pictures must only be exported once");
+        assert!(paths.contains(&"/pictures/ab/cd/abcd.jpg".into()));
+        assert!(paths.contains(&missing), "an unavailable file must reach the copy failure report");
+        server.join().unwrap();
+
+        let (base, server) = serve(vec![answer("200 OK", &[], b"{}")]);
+        assert!(album_picture_paths(&store, &settings(base), "path:Trips", true).is_err());
+        server.join().unwrap();
     }
 
     #[test]
